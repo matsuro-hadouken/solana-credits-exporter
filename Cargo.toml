@@ -1,0 +1,15 @@
+[package]
+name = "solana-credits-exporter"
+version = "0.1.0"
+edition = "2021"
+description = "Credits Exporter"
+license = "MIT"
+repository = "https://github.com/matsuro-hadouken/solana-credits-exporter"
+
+[dependencies]
+serde_json = "1.0"
+solana-client = "1.10.0"
+solana-sdk = "1.10.0"
+prometheus = "0.13.4"
+hyper = { version = "0.14", features = ["full"] }
+tokio = { version = "1.39.3", features = ["full"] }
