@@ -1,4 +1,4 @@
-use hyper::{Body, Response, Server};
+use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use solana_client::rpc_client::RpcClient;
 use std::sync::Arc;
@@ -124,9 +124,20 @@ fn export_prometheus_metrics(validators: Vec<ValidatorMetrics>, active_count: us
 }
 
 // HTTP handler for serving Prometheus metrics
-async fn serve_metrics(cache: Arc<Mutex<MetricsCache>>) -> Result<Response<Body>, Infallible> {
-    let cache = cache.lock().await;  // Lock the cache for reading in async context
-    Ok(Response::new(Body::from(cache.data.clone())))
+async fn serve_metrics(
+    req: Request<Body>,
+    cache: Arc<Mutex<MetricsCache>>,
+) -> Result<Response<Body>, Infallible> {
+    if req.uri().path() == "/metrics" {
+        let cache = cache.lock().await;
+        Ok(Response::new(Body::from(cache.data.clone())))
+    } else {
+        let not_found = Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("404 Not Found"))
+            .unwrap();
+        Ok(not_found)
+    }
 }
 
 // Main function to run the exporter
@@ -168,15 +179,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Serve metrics on 127.0.0.1:59872
+    // Serve metrics on 127.0.0.1:59872 only for `/metrics` route
     let addr = ([127, 0, 0, 1], 59872).into();
     let make_svc = make_service_fn(move |_conn| {
         let cache = Arc::clone(&cache);
-        async move { Ok::<_, Infallible>(service_fn(move |_| serve_metrics(Arc::clone(&cache)))) }
+        async move { Ok::<_, Infallible>(service_fn(move |req| {
+            let cache = Arc::clone(&cache);
+            async move { serve_metrics(req, cache).await }  // Pass `req` and `cache`
+        })) }
     });
     let server = Server::bind(&addr).serve(make_svc);
 
-    println!("Serving metrics on http://127.0.0.1:59872/");
+    println!("Serving metrics on http://127.0.0.1:59872/metrics");
     server.await?;
 
     Ok(())
