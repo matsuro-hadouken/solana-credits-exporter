@@ -101,9 +101,9 @@ fn export_prometheus_metrics(validators: Vec<ValidatorMetrics>, active_count: us
     }
 
     // Active validator count
-    output.push_str("# HELP solana_validator_active_count Total number of active validators\n");
-    output.push_str("# TYPE solana_validator_active_count gauge\n");
-    output.push_str(&format!("solana_validator_active_count {}\n", active_count));
+    output.push_str("# HELP solana_validator_active Total number of active validators\n");
+    output.push_str("# TYPE solana_validator_active gauge\n");
+    output.push_str(&format!("solana_validator_active {}\n", active_count));
 
     // RPC response status
     output.push_str("# HELP solana_validator_exporter_last_rpc_status RPC response status (1=success, 0=failure)\n");
