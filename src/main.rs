@@ -39,23 +39,30 @@ fn fetch_and_calculate_metrics(client: &RpcClient) -> Result<(Vec<ValidatorMetri
     let mut active_count = 0;
 
     for account in vote_accounts.current {
-        if let Some((_, credits_earned, _)) = account.epoch_credits.last() {
-            if *credits_earned > 0 {
-                active_count += 1;
-                let root_distance = top_root_slot.saturating_sub(account.root_slot);
-                let vote_distance = top_vote_slot.saturating_sub(account.last_vote);
+        // Ensure the validator has epoch credits
+        if let Some((_, current_credits, _)) = account.epoch_credits.last() {
+            // Check if there are at least two entries in epoch_credits to compare current and previous credits
+            if let Some((_, previous_credits, _)) = account.epoch_credits.iter().rev().nth(1) {
+                if *current_credits > *previous_credits {
+                    active_count += 1;
+                    let root_distance = top_root_slot.saturating_sub(account.root_slot);
+                    let vote_distance = top_vote_slot.saturating_sub(account.last_vote);
 
-                validator_metrics.push(ValidatorMetrics {
-                    vote_pubkey: account.vote_pubkey.clone(),
-                    root_distance,
-                    vote_distance,
-                    credits_earned: *credits_earned,
-                    rank: 0,
-                });
+                    let credits_earned = *current_credits - *previous_credits;
+
+                    validator_metrics.push(ValidatorMetrics {
+                        vote_pubkey: account.vote_pubkey.clone(),
+                        root_distance,
+                        vote_distance,
+                        credits_earned,
+                        rank: 0,
+                    });
+                }
             }
         }
     }
 
+    // Sort validators by credits earned and assign rank
     validator_metrics.sort_by(|a, b| b.credits_earned.cmp(&a.credits_earned));
     for (rank, validator) in validator_metrics.iter_mut().enumerate() {
         validator.rank = rank + 1;
@@ -64,24 +71,56 @@ fn fetch_and_calculate_metrics(client: &RpcClient) -> Result<(Vec<ValidatorMetri
     Ok((validator_metrics, active_count))
 }
 
-fn export_prometheus_metrics(validators: Vec<ValidatorMetrics>, active_count: usize, rpc_status: u8, rpc_duration: f64, rpc_timeout: u8) -> String {
+fn export_prometheus_metrics(
+    validators: Vec<ValidatorMetrics>,
+    active_count: usize,
+    rpc_status: u8,
+    rpc_duration: f64,
+    rpc_timeout: u8,
+) -> String {
     let mut output = String::new();
-    
-    // per-validator metrics
-    output.push_str("# HELP solana_validator Metrics for each validator\n");
-    output.push_str("# TYPE solana_validator gauge\n");
+
+    // Rating position for each validator (Rank)
+    output.push_str("# HELP solana_validator_rating_position Rating position of each validator\n");
+    output.push_str("# TYPE solana_validator_rating_position gauge\n");
     for validator in &validators {
         output.push_str(&format!(
-            "solana_validator{{identity=\"{}\",root_distance=\"{}\",vote_distance=\"{}\",credits_so_far=\"{}\"}} {}\n",
-            validator.vote_pubkey,
-            validator.root_distance,
-            validator.vote_distance,
-            validator.credits_earned,
-            validator.rank,
+            "solana_validator_rating_position{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.rank
         ));
     }
 
-    // top validators
+    // Root distance for each validator
+    output.push_str("# HELP solana_validator_root_distance Root distance for each validator\n");
+    output.push_str("# TYPE solana_validator_root_distance gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_root_distance{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.root_distance
+        ));
+    }
+
+    // Vote distance for each validator
+    output.push_str("# HELP solana_validator_vote_distance Vote distance for each validator\n");
+    output.push_str("# TYPE solana_validator_vote_distance gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_vote_distance{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.vote_distance
+        ));
+    }
+
+    // Credits earned for each validator
+    output.push_str("# HELP solana_validator_credits_so_far Credits earned by each validator\n");
+    output.push_str("# TYPE solana_validator_credits_so_far gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_credits_so_far{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.credits_earned
+        ));
+    }
+
+    // Top validator metrics
     output.push_str("# HELP solana_validator_top_1 Credits earned by the top 1 validator\n");
     output.push_str("# TYPE solana_validator_top_1 gauge\n");
     if let Some(top_1) = validators.get(0) {
