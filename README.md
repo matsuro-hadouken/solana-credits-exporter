@@ -8,7 +8,7 @@ She chases the rabbit, and it bounds into a rabbit hole. (c) Charles Lutwidge Do
 ```bash
 cargo build --release
 ```
-```toml
+```sh
 [Unit]
 Description=Solana Credits Exporter
 After=network.target
