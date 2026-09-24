@@ -1,0 +1,117 @@
+{
+  "current": [
+    {
+      "activatedStake": 347671486449531,
+      "commission": 100,
+      "epochCredits": [
+        [
+          1040,
+          2266983401,
+          2260203642
+        ],
+        [
+          1041,
+          2273687040,
+          2266983401
+        ],
+        [
+          1042,
+          2273751687,
+          2273687040
+        ],
+        [
+          18446744073709551615,
+          18446744073709551615,
+          18446744073709551615
+        ],
+        [
+          1042,
+          7714679107,
+          2273751687
+        ]
+      ],
+      "epochVoteAccount": true,
+      "inflationRewardsCommissionBps": 10000,
+      "lastVote": 444630533,
+      "nodePubkey": "Txh6mKsvA8rwesigHzALTiFggyrkGDVtMP2vicuepAy",
+      "rootSlot": 444630517,
+      "votePubkey": "CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D"
+    },
+    {
+      "activatedStake": 296603043095931,
+      "commission": 100,
+      "epochCredits": [
+        [
+          1039,
+          349596791,
+          342812329
+        ],
+        [
+          1040,
+          355497436,
+          349596791
+        ],
+        [
+          1041,
+          362047935,
+          355497436
+        ],
+        [
+          18446744073709551615,
+          18446744073709551615,
+          18446744073709551615
+        ],
+        [
+          1042,
+          5285667253,
+          362047935
+        ]
+      ],
+      "epochVoteAccount": true,
+      "inflationRewardsCommissionBps": 10000,
+      "lastVote": 444630533,
+      "nodePubkey": "vyRa8J7ULHfUAdnkTHP3YGhcLWaLURXLmD7CiZkMzWg",
+      "rootSlot": 444630144,
+      "votePubkey": "9LjQ5UC1gyebUySAbodzHJdLSkYAYgVeQcr2vv6FZP6E"
+    }
+  ],
+  "delinquent": [
+    {
+      "activatedStake": 319591285130492,
+      "commission": 100,
+      "epochCredits": [
+        [
+          1037,
+          1914939501,
+          1908123207
+        ],
+        [
+          1038,
+          1921733740,
+          1914939501
+        ],
+        [
+          1039,
+          1928258307,
+          1921733740
+        ],
+        [
+          1040,
+          1934867165,
+          1928258307
+        ],
+        [
+          1041,
+          1941431292,
+          1934867165
+        ]
+      ],
+      "epochVoteAccount": true,
+      "inflationRewardsCommissionBps": 10000,
+      "lastVote": 444613132,
+      "nodePubkey": "3muw1JVkkBJoSA3F4qScCvLgTVCpP3wHEXjCtkiq277w",
+      "rootSlot": 444613101,
+      "votePubkey": "pitRb7yRWtjfb9vSQCuxTo3jad18XqQk5CjdtLKwaJa"
+    }
+  ]
+}

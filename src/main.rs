@@ -1,13 +1,21 @@
-use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
-use solana_client::rpc_client::RpcClient;
+use hyper::{Body, Request, Response, Server, StatusCode};
+use solana_client::{
+    nonblocking::rpc_client::RpcClient, rpc_request::RpcRequest, rpc_response::RpcVoteAccountStatus,
+};
+use solana_sdk::commitment_config::CommitmentConfig;
+
+use std::convert::Infallible;
+use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::task;
 use tokio::time::{sleep, timeout};
-use tokio::sync::Mutex;
-use std::error::Error;
-use std::convert::Infallible;
+
+const RPC_URL: &str = "https://api.testnet.solana.com";
+const MIGRATION_MARKER: (u64, u64, u64) = (u64::MAX, u64::MAX, u64::MAX);
+type FetchError = Box<dyn Error + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct ValidatorMetrics {
@@ -26,49 +34,113 @@ struct MetricsCache {
 impl MetricsCache {
     fn new() -> Self {
         Self {
-            data: String::new(),
+            data: export_prometheus_metrics(vec![], 0, 0, 0.0, 0),
         }
     }
 }
 
-fn fetch_and_calculate_metrics(client: &RpcClient) -> Result<(Vec<ValidatorMetrics>, usize), Box<dyn Error + Send + Sync>> {
-    let vote_accounts = client.get_vote_accounts()?;
-    let top_root_slot = vote_accounts.current.iter().map(|v| v.root_slot).max().unwrap_or(0);
-    let top_vote_slot = vote_accounts.current.iter().map(|v| v.last_vote).max().unwrap_or(0);
-    let mut validator_metrics: Vec<ValidatorMetrics> = Vec::new();
-    let mut active_count = 0;
+// Alpenglow rewards are lamports (voter + leader), not Tower voting points.
+fn epoch_rewards(
+    history: &[(u64, u64, u64)],
+    epoch: u64,
+    migration_epoch: u64,
+) -> Result<u64, FetchError> {
+    if epoch < migration_epoch {
+        return Err("RPC epoch precedes Alpenglow migration".into());
+    }
+    let segment = match history.iter().position(|entry| *entry == MIGRATION_MARKER) {
+        Some(index) => &history[index + 1..],
+        // During migration, an account without the marker has only Tower credits.
+        None if epoch == migration_epoch => return Ok(0),
+        None => history,
+    };
+    match segment.iter().rev().find(|entry| entry.0 == epoch) {
+        Some((_, total, baseline)) => total
+            .checked_sub(*baseline)
+            .ok_or_else(|| "RPC credit total is below its baseline".into()),
+        None => Ok(0),
+    }
+}
 
-    for account in vote_accounts.current {
-        // Ensure the validator has epoch credits
-        if let Some((_, current_credits, _)) = account.epoch_credits.last() {
-            // Check if there are at least two entries in epoch_credits to compare current and previous credits
-            if let Some((_, previous_credits, _)) = account.epoch_credits.iter().rev().nth(1) {
-                if *current_credits > *previous_credits {
-                    active_count += 1;
-                    let root_distance = top_root_slot.saturating_sub(account.root_slot);
-                    let vote_distance = top_vote_slot.saturating_sub(account.last_vote);
+fn calculate_metrics(
+    accounts: RpcVoteAccountStatus,
+    epoch: u64,
+    migration_epoch: u64,
+) -> Result<(Vec<ValidatorMetrics>, usize), FetchError> {
+    let top_root = accounts
+        .current
+        .iter()
+        .map(|a| a.root_slot)
+        .max()
+        .unwrap_or(0);
+    let top_vote = accounts
+        .current
+        .iter()
+        .map(|a| a.last_vote)
+        .max()
+        .unwrap_or(0);
+    let active_count = accounts.current.len();
+    let mut validators = Vec::with_capacity(active_count);
+    for account in accounts.current {
+        validators.push(ValidatorMetrics {
+            vote_pubkey: account.vote_pubkey,
+            root_distance: top_root.saturating_sub(account.root_slot),
+            vote_distance: top_vote.saturating_sub(account.last_vote),
+            credits_earned: epoch_rewards(&account.epoch_credits, epoch, migration_epoch)?,
+            rank: 0,
+        });
+    }
+    validators.sort_by(|a, b| {
+        b.credits_earned
+            .cmp(&a.credits_earned)
+            .then_with(|| a.vote_pubkey.cmp(&b.vote_pubkey))
+    });
+    // Equal rewards share a rank; pubkey keeps output order deterministic.
+    for i in 0..validators.len() {
+        validators[i].rank =
+            if i > 0 && validators[i].credits_earned == validators[i - 1].credits_earned {
+                validators[i - 1].rank
+            } else {
+                i + 1
+            };
+    }
+    Ok((validators, active_count))
+}
 
-                    let credits_earned = *current_credits - *previous_credits;
-
-                    validator_metrics.push(ValidatorMetrics {
-                        vote_pubkey: account.vote_pubkey.clone(),
-                        root_distance,
-                        vote_distance,
-                        credits_earned,
-                        rank: 0,
-                    });
-                }
-            }
+async fn fetch_and_calculate_metrics(
+    client: &RpcClient,
+    migration_epoch: &mut Option<u64>,
+) -> Result<(Vec<ValidatorMetrics>, usize, u64), FetchError> {
+    let migration = match *migration_epoch {
+        Some(epoch) => epoch,
+        None => {
+            let cert: serde_json::Value = client
+                .send(
+                    RpcRequest::Custom {
+                        method: "getAgGenesisCert",
+                    },
+                    serde_json::json!([]),
+                )
+                .await?;
+            let slot = cert
+                .get("block")
+                .and_then(|b| b.get("slot"))
+                .and_then(|s| s.as_u64())
+                .ok_or("RPC has no Alpenglow genesis certificate")?;
+            let schedule = client.get_epoch_schedule().await?;
+            let epoch = schedule.get_epoch(slot);
+            *migration_epoch = Some(epoch);
+            epoch
         }
+    };
+    let before = client.get_epoch_info().await?;
+    let accounts = client.get_vote_accounts().await?;
+    let after = client.get_epoch_info().await?;
+    if before.epoch != after.epoch {
+        return Err("epoch changed during RPC sample; retrying next poll".into());
     }
-
-    // Sort validators by credits earned and assign rank
-    validator_metrics.sort_by(|a, b| b.credits_earned.cmp(&a.credits_earned));
-    for (rank, validator) in validator_metrics.iter_mut().enumerate() {
-        validator.rank = rank + 1;
-    }
-
-    Ok((validator_metrics, active_count))
+    let (validators, count) = calculate_metrics(accounts, after.epoch, migration)?;
+    Ok((validators, count, after.epoch))
 }
 
 fn export_prometheus_metrics(
@@ -81,7 +153,7 @@ fn export_prometheus_metrics(
     let mut output = String::new();
 
     // Rating position for each validator (Rank)
-    output.push_str("# HELP solana_validator_rating_position Rating position of each validator\n");
+    output.push_str("# HELP solana_validator_rating_position Rank by current-epoch Alpenglow reward lamports (voter plus leader, not voting performance)\n");
     output.push_str("# TYPE solana_validator_rating_position gauge\n");
     for validator in &validators {
         output.push_str(&format!(
@@ -91,7 +163,7 @@ fn export_prometheus_metrics(
     }
 
     // Root distance for each validator
-    output.push_str("# HELP solana_validator_root_distance Root distance for each validator\n");
+    output.push_str("# HELP solana_validator_root_distance Final-certificate root distance from the highest current validator root, in slots\n");
     output.push_str("# TYPE solana_validator_root_distance gauge\n");
     for validator in &validators {
         output.push_str(&format!(
@@ -101,7 +173,7 @@ fn export_prometheus_metrics(
     }
 
     // Vote distance for each validator
-    output.push_str("# HELP solana_validator_vote_distance Vote distance for each validator\n");
+    output.push_str("# HELP solana_validator_vote_distance Reward-account lastVote distance from the highest current validator lastVote, in slots\n");
     output.push_str("# TYPE solana_validator_vote_distance gauge\n");
     for validator in &validators {
         output.push_str(&format!(
@@ -111,7 +183,7 @@ fn export_prometheus_metrics(
     }
 
     // Credits earned for each validator
-    output.push_str("# HELP solana_validator_credits_so_far Credits earned by each validator\n");
+    output.push_str("# HELP solana_validator_credits_so_far Compatibility alias for current-epoch Alpenglow reward lamports (not Tower credits)\n");
     output.push_str("# TYPE solana_validator_credits_so_far gauge\n");
     for validator in &validators {
         output.push_str(&format!(
@@ -120,44 +192,73 @@ fn export_prometheus_metrics(
         ));
     }
 
-    // Top validator metrics
-    output.push_str("# HELP solana_validator_top_1 Credits earned by the top 1 validator\n");
-    output.push_str("# TYPE solana_validator_top_1 gauge\n");
-    if let Some(top_1) = validators.get(0) {
-        output.push_str(&format!("solana_validator_top_1 {}\n", top_1.credits_earned));
+    output.push_str("# HELP solana_validator_alpenglow_rewards_lamports Current-epoch accrued voter plus leader reward lamports before distribution\n");
+    output.push_str("# TYPE solana_validator_alpenglow_rewards_lamports gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_alpenglow_rewards_lamports{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.credits_earned
+        ));
     }
 
-    output.push_str("# HELP solana_validator_top_100 Credits earned by the top 100 validator\n");
+    // Top validator metrics
+    output.push_str("# HELP solana_validator_top_1 Alpenglow reward lamports at sorted position 1 (not voting performance)\n");
+    output.push_str("# TYPE solana_validator_top_1 gauge\n");
+    if let Some(top_1) = validators.first() {
+        output.push_str(&format!(
+            "solana_validator_top_1 {}\n",
+            top_1.credits_earned
+        ));
+    }
+
+    output.push_str("# HELP solana_validator_top_100 Alpenglow reward lamports at sorted position 100 (not voting performance)\n");
     output.push_str("# TYPE solana_validator_top_100 gauge\n");
     if let Some(top_100) = validators.get(99) {
-        output.push_str(&format!("solana_validator_top_100 {}\n", top_100.credits_earned));
+        output.push_str(&format!(
+            "solana_validator_top_100 {}\n",
+            top_100.credits_earned
+        ));
     }
 
-    output.push_str("# HELP solana_validator_top_200 Credits earned by the top 200 validator\n");
+    output.push_str("# HELP solana_validator_top_200 Alpenglow reward lamports at sorted position 200 (not voting performance)\n");
     output.push_str("# TYPE solana_validator_top_200 gauge\n");
     if let Some(top_200) = validators.get(199) {
-        output.push_str(&format!("solana_validator_top_200 {}\n", top_200.credits_earned));
+        output.push_str(&format!(
+            "solana_validator_top_200 {}\n",
+            top_200.credits_earned
+        ));
     }
 
     // Active validator count
-    output.push_str("# HELP solana_validator_active Total number of active validators\n");
+    output.push_str("# HELP solana_validator_active Number of RPC current validators, including zero-reward accounts\n");
     output.push_str("# TYPE solana_validator_active gauge\n");
     output.push_str(&format!("solana_validator_active {}\n", active_count));
 
     // RPC response status
     output.push_str("# HELP solana_validator_exporter_last_rpc_status RPC response status (1=success, 0=failure)\n");
     output.push_str("# TYPE solana_validator_exporter_last_rpc_status gauge\n");
-    output.push_str(&format!("solana_validator_exporter_last_rpc_status {}\n", rpc_status));
+    output.push_str(&format!(
+        "solana_validator_exporter_last_rpc_status {}\n",
+        rpc_status
+    ));
 
     // RPC response timeout
     output.push_str("# HELP solana_validator_exporter_rpc_response_timeout RPC response timeout (1=timeout, 0=no timeout)\n");
     output.push_str("# TYPE solana_validator_exporter_rpc_response_timeout gauge\n");
-    output.push_str(&format!("solana_validator_exporter_rpc_response_timeout {}\n", rpc_timeout));
+    output.push_str(&format!(
+        "solana_validator_exporter_rpc_response_timeout {}\n",
+        rpc_timeout
+    ));
 
     // RPC duration
-    output.push_str("# HELP solana_validator_exporter_rpc_duration_seconds RPC response time in seconds\n");
+    output.push_str(
+        "# HELP solana_validator_exporter_rpc_duration_seconds RPC response time in seconds\n",
+    );
     output.push_str("# TYPE solana_validator_exporter_rpc_duration_seconds gauge\n");
-    output.push_str(&format!("solana_validator_exporter_rpc_duration_seconds {}\n", rpc_duration));
+    output.push_str(&format!(
+        "solana_validator_exporter_rpc_duration_seconds {}\n",
+        rpc_duration
+    ));
 
     output
 }
@@ -169,7 +270,13 @@ async fn serve_metrics(
 ) -> Result<Response<Body>, Infallible> {
     if req.uri().path() == "/metrics" {
         let cache = cache.lock().await;
-        Ok(Response::new(Body::from(cache.data.clone())))
+        Ok(Response::builder()
+            .header(
+                hyper::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
+            .body(Body::from(cache.data.clone()))
+            .unwrap())
     } else {
         let not_found = Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -187,23 +294,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Background task to fetch and update metrics
     task::spawn(async move {
-        let client = RpcClient::new("https://api.mainnet-beta.solana.com".to_string());
+        let client =
+            RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
+        let mut migration_epoch = None;
 
         loop {
             let start = Instant::now();
             let result = timeout(Duration::from_secs_f32(4.5), async {
-                fetch_and_calculate_metrics(&client)
+                fetch_and_calculate_metrics(&client, &mut migration_epoch).await
             })
             .await;
 
             // Only lock the cache when updating it
             let new_data = match result {
-                Ok(Ok((validator_metrics, active_count))) => {
+                Ok(Ok((validator_metrics, active_count, epoch))) => {
                     let duration = start.elapsed().as_secs_f64();
-                    export_prometheus_metrics(validator_metrics, active_count, 1, duration, 0)
+                    let mut data =
+                        export_prometheus_metrics(validator_metrics, active_count, 1, duration, 0);
+                    data.push_str(&format!("# HELP solana_validator_exporter_epoch Epoch of this successful sample\n# TYPE solana_validator_exporter_epoch gauge\nsolana_validator_exporter_epoch {}\n", epoch));
+                    data
                 }
-                Ok(Err(_)) => export_prometheus_metrics(vec![], 0, 0, 0.0, 0),  // RPC failure
-                Err(_) => export_prometheus_metrics(vec![], 0, 0, 0.0, 1),     // Timeout case
+                Ok(Err(error)) => {
+                    eprintln!("Testnet RPC sample failed: {error}");
+                    export_prometheus_metrics(vec![], 0, 0, start.elapsed().as_secs_f64(), 0)
+                }
+                Err(_) => {
+                    eprintln!("Testnet RPC sample timed out after 4.5 seconds");
+                    export_prometheus_metrics(vec![], 0, 0, start.elapsed().as_secs_f64(), 1)
+                }
             };
 
             // Update the cache outside the main loop to minimize the lock time
@@ -212,9 +330,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 cache.data = new_data;
             }
 
-            // Calculate next delay based on RPC call time + 2 seconds
-            let duration = start.elapsed().as_secs_f64();
-            sleep(Duration::from_secs_f64(duration + 2.0)).await;
+            // Allow two seconds between completed polling attempts.
+            sleep(Duration::from_secs(2)).await;
         }
     });
 
@@ -222,10 +339,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let addr = ([127, 0, 0, 1], 59872).into();
     let make_svc = make_service_fn(move |_conn| {
         let cache = Arc::clone(&cache);
-        async move { Ok::<_, Infallible>(service_fn(move |req| {
-            let cache = Arc::clone(&cache);
-            async move { serve_metrics(req, cache).await }  // Pass `req` and `cache`
-        })) }
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req| {
+                let cache = Arc::clone(&cache);
+                async move { serve_metrics(req, cache).await } // Pass `req` and `cache`
+            }))
+        }
     });
     let server = Server::bind(&addr).serve(make_svc);
 
@@ -233,4 +352,190 @@ async fn main() -> Result<(), Box<dyn Error>> {
     server.await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_fixture_restores_accounts_without_tower_rewards() {
+        let accounts =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        let (validators, count) = calculate_metrics(accounts, 1042, 1042).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(validators[0].credits_earned, 5_440_927_420);
+        assert_eq!(validators[1].credits_earned, 4_923_619_318);
+        assert_eq!(validators[0].rank, 1);
+        assert_eq!(validators[1].rank, 2);
+        let text = export_prometheus_metrics(validators, count, 1, 0.2, 0);
+        assert!(text.contains("solana_validator_active 2\n"));
+        assert!(text.contains("solana_validator_top_1 5440927420\n"));
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("solana_validator_alpenglow_rewards_lamports{"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn migration_marker_and_duplicate_epoch_are_separate_segments() {
+        let history = [(1042, 100, 50), MIGRATION_MARKER, (1042, 125, 100)];
+        assert_eq!(epoch_rewards(&history, 1042, 1042).unwrap(), 25);
+        assert_eq!(epoch_rewards(&history[..2], 1042, 1042).unwrap(), 0);
+        assert_eq!(epoch_rewards(&history[..1], 1042, 1042).unwrap(), 0);
+        assert_eq!(
+            epoch_rewards(&[MIGRATION_MARKER, (1042, 25, 0)], 1042, 1042).unwrap(),
+            25
+        );
+    }
+
+    #[test]
+    fn post_migration_single_entry_and_history_without_marker() {
+        assert_eq!(epoch_rewards(&[(1043, 150, 100)], 1043, 1042).unwrap(), 50);
+        assert_eq!(epoch_rewards(&[(1100, 900, 700)], 1100, 1042).unwrap(), 200);
+        assert_eq!(epoch_rewards(&[(1043, 150, 100)], 1044, 1042).unwrap(), 0);
+        assert_eq!(epoch_rewards(&[], 1043, 1042).unwrap(), 0);
+        assert!(epoch_rewards(&[(1043, 1, 100)], 1043, 1042).is_err());
+        assert!(epoch_rewards(&[], 1041, 1042).is_err());
+    }
+
+    #[test]
+    fn epoch_rollover_keeps_current_accounts_and_ties_have_same_rank() {
+        let accounts =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        let (validators, count) = calculate_metrics(accounts, 1043, 1042).unwrap();
+        assert_eq!(count, 2);
+        assert!(validators
+            .iter()
+            .all(|v| v.credits_earned == 0 && v.rank == 1));
+        assert!(validators[0].vote_pubkey < validators[1].vote_pubkey);
+    }
+
+    #[tokio::test]
+    async fn http_routes_and_startup_health_are_exposed() {
+        let cache = Arc::new(Mutex::new(MetricsCache::new()));
+        let response = serve_metrics(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+            cache.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[hyper::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("version=0.0.4"));
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("solana_validator_exporter_last_rpc_status 0\n"));
+        let response = serve_metrics(Request::new(Body::empty()), cache)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // A real local HTTP transport checks the async RPC path, including cancellation.
+    async fn mock_rpc(
+        results: Vec<serde_json::Value>,
+        delay: Duration,
+    ) -> (RpcClient, tokio::task::JoinHandle<()>) {
+        let results = Arc::new(Mutex::new(std::collections::VecDeque::from(results)));
+        let service = make_service_fn(move |_| {
+            let results = results.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |request: Request<Body>| {
+                    let results = results.clone();
+                    async move {
+                        sleep(delay).await;
+                        let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
+                        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let result = if request["method"] == "getVersion" {
+                            serde_json::json!({"solana-core":"4.3.0", "feature-set":3383571666_u64})
+                        } else {
+                            results
+                                .lock()
+                                .await
+                                .pop_front()
+                                .unwrap_or(serde_json::Value::Null)
+                        };
+                        Ok::<_, Infallible>(Response::new(Body::from(
+                            serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                                .to_string(),
+                        )))
+                    }
+                }))
+            }
+        });
+        let server = Server::bind(&([127, 0, 0, 1], 0).into()).serve(service);
+        let client = RpcClient::new(format!("http://{}", server.local_addr()));
+        let task = tokio::spawn(async move {
+            server.await.unwrap();
+        });
+        (client, task)
+    }
+
+    #[tokio::test]
+    async fn crossing_epoch_boundary_rejects_inconsistent_sample() {
+        let epoch = |n| {
+            serde_json::json!({"epoch":n, "slotIndex":0, "slotsInEpoch":432000,
+            "absoluteSlot":444620256, "blockHeight":1, "transactionCount":1})
+        };
+        let accounts =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        let (client, server) =
+            mock_rpc(vec![epoch(1042), accounts, epoch(1043)], Duration::ZERO).await;
+        let result = fetch_and_calculate_metrics(&client, &mut Some(1042)).await;
+        server.abort();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("epoch changed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stalled_rpc_is_cancellable() {
+        let (client, server) = mock_rpc(vec![], Duration::from_secs(5)).await;
+        let result = timeout(
+            Duration::from_millis(50),
+            fetch_and_calculate_metrics(&client, &mut None),
+        )
+        .await;
+        server.abort();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn missing_genesis_certificate_is_not_treated_as_rewards() {
+        let (client, server) = mock_rpc(vec![serde_json::Value::Null], Duration::ZERO).await;
+        let result = fetch_and_calculate_metrics(&client, &mut None).await;
+        server.abort();
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no Alpenglow genesis"));
+    }
+
+    #[tokio::test]
+    #[ignore = "queries the live public testnet RPC"]
+    async fn live_testnet_sample() {
+        let client =
+            RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
+        let (validators, count, epoch) = timeout(
+            Duration::from_secs_f32(4.5),
+            fetch_and_calculate_metrics(&client, &mut None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(count > 0);
+        assert_eq!(count, validators.len());
+        assert!(validators.iter().any(|v| v.credits_earned > 0));
+        let output = export_prometheus_metrics(validators, count, 1, 0.0, 0);
+        assert!(output.contains("solana_validator_top_1 "));
+        println!("Testnet epoch {epoch}: exported {count} validators with Alpenglow rewards");
+    }
 }

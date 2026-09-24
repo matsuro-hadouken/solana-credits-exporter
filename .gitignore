@@ -1,1 +1,9 @@
 target/
+
+# Local tooling and runtime files
+/.agents/
+/.codex/
+.env
+.env.*
+!.env.example
+*.log
