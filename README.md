@@ -10,7 +10,7 @@ cargo build --release --locked
 ./target/release/solana-credits-exporter
 ```
 
-Prometheus endpoint: `http://127.0.0.1:59872/metrics`.
+Prometheus endpoint: `http://<host>:59872/metrics` (binds all interfaces; restrict with the host firewall).
 Rebuild and replace your existing service binary to apply the change; the service
 configuration below is an example, not an automatic installation.
 

@@ -379,8 +379,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Serve metrics on 127.0.0.1:59872 only for `/metrics` route
-    let addr = ([127, 0, 0, 1], 59872).into();
+    // Serve metrics on all interfaces, port 59872, only for the `/metrics` route.
+    // Reachability is governed by the host firewall, not by the bind address.
+    let addr = ([0, 0, 0, 0], 59872).into();
     let make_svc = make_service_fn(move |_conn| {
         let cache = Arc::clone(&cache);
         async move {
@@ -392,7 +393,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     let server = Server::bind(&addr).serve(make_svc);
 
-    println!("Serving metrics on http://127.0.0.1:59872/metrics");
+    println!("Serving metrics on http://0.0.0.0:59872/metrics");
     server.await?;
 
     Ok(())
