@@ -46,6 +46,38 @@ struct ValidatorMetrics {
     /// Voter reward per staked SOL relative to the stake-weighted cluster mean.
     /// 1.0 = included in reward certificates as often as the average stake.
     pub inclusion_relative: Option<f64>,
+    /// Share (0..1) of the stake of all validators with an `inclusion_relative` value
+    /// whose inclusion is strictly below this validator's. 1.0 = best-included.
+    pub stake_beaten_share: Option<f64>,
+}
+
+/// Fills `stake_beaten_share` from `inclusion_relative` and stake in one sorted pass.
+fn fill_stake_beaten_share(validators: &mut [ValidatorMetrics]) {
+    let mut scored: Vec<(f64, u64, usize)> = validators
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.inclusion_relative.map(|x| (x, v.activated_stake, i)))
+        .collect();
+    let total: u128 = scored.iter().map(|(_, stake, _)| *stake as u128).sum();
+    if total == 0 {
+        return;
+    }
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // `below` = stake of everyone with strictly smaller inclusion; ties share a value.
+    let mut below: u128 = 0;
+    let mut i = 0;
+    while i < scored.len() {
+        let mut j = i;
+        while j < scored.len() && scored[j].0 == scored[i].0 {
+            j += 1;
+        }
+        let share = below as f64 / total as f64;
+        for entry in &scored[i..j] {
+            validators[entry.2].stake_beaten_share = Some(share);
+            below += entry.1 as u128;
+        }
+        i = j;
+    }
 }
 
 /// Cluster-wide sums behind the leader-lump model, from one sample.
@@ -159,8 +191,9 @@ fn same_reward_per_stake(a: &ValidatorMetrics, b: &ValidatorMetrics) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 struct EpochSnapshot {
     pub epoch: u64,
-    /// `(vote pubkey, inclusion_relative)` for every validator that had a value.
-    pub inclusion_relative: Vec<(String, f64)>,
+    /// `(vote pubkey, inclusion_relative, stake_beaten_share)` for every validator that
+    /// had an inclusion value.
+    pub inclusion_relative: Vec<(String, f64, f64)>,
 }
 
 /// Keeps the newest sample of the running epoch and freezes it when the first sample of
@@ -183,7 +216,15 @@ impl EpochMemory {
             epoch,
             inclusion_relative: validators
                 .iter()
-                .filter_map(|v| v.inclusion_relative.map(|i| (v.vote_pubkey.clone(), i)))
+                .filter_map(|v| {
+                    v.inclusion_relative.map(|i| {
+                        (
+                            v.vote_pubkey.clone(),
+                            i,
+                            v.stake_beaten_share.unwrap_or(0.0),
+                        )
+                    })
+                })
                 .collect(),
         });
     }
@@ -308,8 +349,10 @@ fn calculate_metrics(
             blocks_produced,
             voter_reward_lamports,
             inclusion_relative,
+            stake_beaten_share: None,
         });
     }
+    fill_stake_beaten_share(&mut validators);
     // Staked accounts first, ordered by reward per staked SOL (exact, no floats);
     // zero-stake accounts last, unranked. Pubkey keeps output order deterministic.
     validators.sort_by(|a, b| {
@@ -466,6 +509,17 @@ fn export_prometheus_metrics(
         }
     }
 
+    output.push_str("# HELP solana_validator_alpenglow_stake_beaten_share Share (0-1) of the stake of all validators with an inclusion value whose inclusion is strictly below this validator's; 1 = best-included in the cluster\n");
+    output.push_str("# TYPE solana_validator_alpenglow_stake_beaten_share gauge\n");
+    for validator in &validators {
+        if let Some(share) = validator.stake_beaten_share {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_stake_beaten_share{{identity=\"{}\"}} {}\n",
+                validator.vote_pubkey, share
+            ));
+        }
+    }
+
     // Previous-epoch scoreboard: the last sample before the boundary, frozen
     output.push_str("# HELP solana_validator_exporter_previous_epoch Epoch described by the *_previous_epoch gauges (its last sample before the boundary); absent until the exporter has crossed an epoch boundary\n");
     output.push_str("# TYPE solana_validator_exporter_previous_epoch gauge\n");
@@ -478,9 +532,18 @@ fn export_prometheus_metrics(
     output.push_str("# HELP solana_validator_alpenglow_inclusion_relative_previous_epoch Final solana_validator_alpenglow_inclusion_relative of the previous epoch, frozen at its last sample before the boundary\n");
     output.push_str("# TYPE solana_validator_alpenglow_inclusion_relative_previous_epoch gauge\n");
     if let Some(previous) = previous {
-        for (vote_pubkey, inclusion) in &previous.inclusion_relative {
+        for (vote_pubkey, inclusion, _) in &previous.inclusion_relative {
             output.push_str(&format!(
                 "solana_validator_alpenglow_inclusion_relative_previous_epoch{{identity=\"{vote_pubkey}\"}} {inclusion}\n"
+            ));
+        }
+    }
+    output.push_str("# HELP solana_validator_alpenglow_stake_beaten_share_previous_epoch Final solana_validator_alpenglow_stake_beaten_share of the previous epoch, frozen at its last sample before the boundary\n");
+    output.push_str("# TYPE solana_validator_alpenglow_stake_beaten_share_previous_epoch gauge\n");
+    if let Some(previous) = previous {
+        for (vote_pubkey, _, share) in &previous.inclusion_relative {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_stake_beaten_share_previous_epoch{{identity=\"{vote_pubkey}\"}} {share}\n"
             ));
         }
     }
@@ -883,6 +946,14 @@ mod tests {
         // above the stake-weighted mean.
         assert!(cihv.inclusion_relative.unwrap() > 1.0);
         assert!(ljq.inclusion_relative.unwrap() > 1.0);
+        // 9LjQ is included more often than CiHv, so it beats CiHv's stake and CiHv beats
+        // nobody; the delinquent account has no inclusion value and is outside the base.
+        assert!(ljq.inclusion_relative.unwrap() > cihv.inclusion_relative.unwrap());
+        assert_eq!(cihv.stake_beaten_share, Some(0.0));
+        assert!(close(
+            ljq.stake_beaten_share.unwrap(),
+            347_671_486_449_531.0 / (347_671_486_449_531.0 + 296_603_043_095_931.0)
+        ));
 
         let count = validators.len();
         let text = export_prometheus_metrics(validators, Some(model), None, count, 1, 0.2, 0);
@@ -897,6 +968,9 @@ mod tests {
                 .count(),
             2
         );
+        assert!(text.contains(
+            "solana_validator_alpenglow_stake_beaten_share{identity=\"CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D\"} 0\n"
+        ));
         // Every gauge name appears in exactly one HELP and one TYPE line.
         let mut names: Vec<&str> = text
             .lines()
@@ -949,6 +1023,7 @@ mod tests {
             blocks_produced: 0.0,
             voter_reward_lamports: None,
             inclusion_relative: inclusion,
+            stake_beaten_share: inclusion.map(|_| 0.25),
         };
         let mut memory = EpochMemory::default();
         memory.observe(1042, &[v("A", Some(0.990)), v("B", None)]);
@@ -960,7 +1035,10 @@ mod tests {
         assert_eq!(frozen.epoch, 1042);
         assert_eq!(
             frozen.inclusion_relative,
-            vec![("A".to_string(), 0.995), ("B".to_string(), 1.001)]
+            vec![
+                ("A".to_string(), 0.995, 0.25),
+                ("B".to_string(), 1.001, 0.25)
+            ]
         );
         // A stale sample from a lagging RPC never overwrites or freezes anything.
         memory.observe(1042, &[v("A", Some(0.1))]);
@@ -969,18 +1047,63 @@ mod tests {
         memory.observe(1044, &[]);
         let frozen = memory.previous().unwrap();
         assert_eq!(frozen.epoch, 1043);
-        assert_eq!(frozen.inclusion_relative, vec![("A".to_string(), 0.7)]);
+        assert_eq!(
+            frozen.inclusion_relative,
+            vec![("A".to_string(), 0.7, 0.25)]
+        );
 
         let text = export_prometheus_metrics(vec![], None, memory.previous(), 0, 1, 0.1, 0);
         assert!(text.contains("solana_validator_exporter_previous_epoch 1043\n"));
         assert!(text.contains(
             "solana_validator_alpenglow_inclusion_relative_previous_epoch{identity=\"A\"} 0.7\n"
         ));
+        assert!(text.contains(
+            "solana_validator_alpenglow_stake_beaten_share_previous_epoch{identity=\"A\"} 0.25\n"
+        ));
         let text = export_prometheus_metrics(vec![], None, None, 0, 1, 0.1, 0);
         assert!(text.contains("# TYPE solana_validator_exporter_previous_epoch gauge\n"));
         assert!(!text
             .lines()
             .any(|l| l.starts_with("solana_validator_exporter_previous_epoch ")));
+    }
+
+    #[test]
+    fn stake_beaten_share_is_strict_and_tie_aware() {
+        let v = |key: &str, stake: u64, inclusion: Option<f64>| ValidatorMetrics {
+            vote_pubkey: key.to_string(),
+            root_distance: 0,
+            vote_distance: 0,
+            credits_earned: 0,
+            activated_stake: stake,
+            rank: 0,
+            leader_slots: 0.0,
+            blocks_produced: 0.0,
+            voter_reward_lamports: None,
+            inclusion_relative: inclusion,
+            stake_beaten_share: None,
+        };
+        // A: 1.0 (stake 10), B: 1.1 (stake 30), C: 1.1 (stake 20), D: 0.9 (stake 40),
+        // E: no inclusion (stake 1000, outside the base).
+        let mut validators = vec![
+            v("A", 10, Some(1.0)),
+            v("B", 30, Some(1.1)),
+            v("C", 20, Some(1.1)),
+            v("D", 40, Some(0.9)),
+            v("E", 1000, None),
+        ];
+        fill_stake_beaten_share(&mut validators);
+        let share = |k: &str| {
+            validators
+                .iter()
+                .find(|v| v.vote_pubkey == k)
+                .unwrap()
+                .stake_beaten_share
+        };
+        assert_eq!(share("D"), Some(0.0));
+        assert_eq!(share("A"), Some(0.4)); // beats D: 40 of 100
+        assert_eq!(share("B"), Some(0.5)); // beats D + A: 50 of 100, tie with C
+        assert_eq!(share("C"), Some(0.5));
+        assert_eq!(share("E"), None);
     }
 
     #[test]
@@ -996,6 +1119,7 @@ mod tests {
             blocks_produced: 0.0,
             voter_reward_lamports: None,
             inclusion_relative: None,
+            stake_beaten_share: None,
         };
         // 3/2 > 4/3 ; 2/4 == 1/2 ; u64::MAX cross products must not overflow.
         assert_eq!(
