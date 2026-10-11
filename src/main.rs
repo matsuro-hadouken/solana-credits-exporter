@@ -154,6 +154,45 @@ fn same_reward_per_stake(a: &ValidatorMetrics, b: &ValidatorMetrics) -> bool {
     cmp_reward_per_stake(a, b) == std::cmp::Ordering::Equal
 }
 
+/// The last successful sample of an epoch, frozen at the boundary and exported for the
+/// whole following epoch as the previous-epoch scoreboard.
+#[derive(Debug, Clone, PartialEq)]
+struct EpochSnapshot {
+    pub epoch: u64,
+    /// `(vote pubkey, inclusion_relative)` for every validator that had a value.
+    pub inclusion_relative: Vec<(String, f64)>,
+}
+
+/// Keeps the newest sample of the running epoch and freezes it when the first sample of
+/// a later epoch arrives. Nothing is frozen until the exporter has crossed a boundary.
+#[derive(Debug, Default)]
+struct EpochMemory {
+    latest: Option<EpochSnapshot>,
+    frozen: Option<EpochSnapshot>,
+}
+
+impl EpochMemory {
+    fn observe(&mut self, epoch: u64, validators: &[ValidatorMetrics]) {
+        match self.latest.as_ref().map(|latest| latest.epoch) {
+            Some(latest_epoch) if epoch > latest_epoch => self.frozen = self.latest.take(),
+            // An RPC node answering behind the one that produced `latest`; ignore.
+            Some(latest_epoch) if epoch < latest_epoch => return,
+            _ => {}
+        }
+        self.latest = Some(EpochSnapshot {
+            epoch,
+            inclusion_relative: validators
+                .iter()
+                .filter_map(|v| v.inclusion_relative.map(|i| (v.vote_pubkey.clone(), i)))
+                .collect(),
+        });
+    }
+
+    fn previous(&self) -> Option<&EpochSnapshot> {
+        self.frozen.as_ref()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MetricsCache {
     pub data: String,
@@ -162,7 +201,7 @@ struct MetricsCache {
 impl MetricsCache {
     fn new() -> Self {
         Self {
-            data: export_prometheus_metrics(vec![], None, 0, 0, 0.0, 0),
+            data: export_prometheus_metrics(vec![], None, None, 0, 0, 0.0, 0),
         }
     }
 }
@@ -346,6 +385,7 @@ async fn fetch_and_calculate_metrics(
 fn export_prometheus_metrics(
     validators: Vec<ValidatorMetrics>,
     model: Option<ClusterRewardModel>,
+    previous: Option<&EpochSnapshot>,
     active_count: usize,
     rpc_status: u8,
     rpc_duration: f64,
@@ -422,6 +462,25 @@ fn export_prometheus_metrics(
             output.push_str(&format!(
                 "solana_validator_alpenglow_inclusion_relative{{identity=\"{}\"}} {}\n",
                 validator.vote_pubkey, inclusion
+            ));
+        }
+    }
+
+    // Previous-epoch scoreboard: the last sample before the boundary, frozen
+    output.push_str("# HELP solana_validator_exporter_previous_epoch Epoch described by the *_previous_epoch gauges (its last sample before the boundary); absent until the exporter has crossed an epoch boundary\n");
+    output.push_str("# TYPE solana_validator_exporter_previous_epoch gauge\n");
+    if let Some(previous) = previous {
+        output.push_str(&format!(
+            "solana_validator_exporter_previous_epoch {}\n",
+            previous.epoch
+        ));
+    }
+    output.push_str("# HELP solana_validator_alpenglow_inclusion_relative_previous_epoch Final solana_validator_alpenglow_inclusion_relative of the previous epoch, frozen at its last sample before the boundary\n");
+    output.push_str("# TYPE solana_validator_alpenglow_inclusion_relative_previous_epoch gauge\n");
+    if let Some(previous) = previous {
+        for (vote_pubkey, inclusion) in &previous.inclusion_relative {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_inclusion_relative_previous_epoch{{identity=\"{vote_pubkey}\"}} {inclusion}\n"
             ));
         }
     }
@@ -580,6 +639,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let client =
             RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
         let mut migration_epoch = None;
+        let mut epoch_memory = EpochMemory::default();
 
         loop {
             let start = Instant::now();
@@ -592,9 +652,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let new_data = match result {
                 Ok(Ok((validator_metrics, active_count, epoch, model))) => {
                     let duration = start.elapsed().as_secs_f64();
+                    epoch_memory.observe(epoch, &validator_metrics);
                     let mut data = export_prometheus_metrics(
                         validator_metrics,
                         model,
+                        epoch_memory.previous(),
                         active_count,
                         1,
                         duration,
@@ -605,11 +667,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 Ok(Err(error)) => {
                     eprintln!("Testnet RPC sample failed: {error}");
-                    export_prometheus_metrics(vec![], None, 0, 0, start.elapsed().as_secs_f64(), 0)
+                    export_prometheus_metrics(
+                        vec![],
+                        None,
+                        epoch_memory.previous(),
+                        0,
+                        0,
+                        start.elapsed().as_secs_f64(),
+                        0,
+                    )
                 }
                 Err(_) => {
                     eprintln!("Testnet RPC sample timed out after 4.5 seconds");
-                    export_prometheus_metrics(vec![], None, 0, 0, start.elapsed().as_secs_f64(), 1)
+                    export_prometheus_metrics(
+                        vec![],
+                        None,
+                        epoch_memory.previous(),
+                        0,
+                        0,
+                        start.elapsed().as_secs_f64(),
+                        1,
+                    )
                 }
             };
 
@@ -665,7 +743,7 @@ mod tests {
         assert_eq!(validators[1].rank, 2);
         assert_eq!(validators[0].reward_per_sol(), Some(16600.029678075633));
         assert_eq!(validators[1].reward_per_sol(), Some(15649.622221147609));
-        let text = export_prometheus_metrics(validators, model, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, model, None, count, 1, 0.2, 0);
         assert!(text.contains("solana_validator_active 2\n"));
         assert!(text.contains("solana_validator_top_1 16600.029678075633\n"));
         // Without block production the model gauges keep HELP/TYPE but carry no samples.
@@ -702,7 +780,7 @@ mod tests {
         assert_eq!(validators[1].rank, 0);
         assert_eq!(validators[1].activated_stake, 0);
         assert_eq!(validators[1].reward_per_sol(), None);
-        let text = export_prometheus_metrics(validators, model, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, model, None, count, 1, 0.2, 0);
         assert_eq!(
             text.lines()
                 .filter(|l| l.starts_with("solana_validator_rating_position{"))
@@ -807,7 +885,7 @@ mod tests {
         assert!(ljq.inclusion_relative.unwrap() > 1.0);
 
         let count = validators.len();
-        let text = export_prometheus_metrics(validators, Some(model), count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, Some(model), None, count, 1, 0.2, 0);
         assert!(text.contains("solana_cluster_alpenglow_blocks_produced 1036\n"));
         assert!(text.contains("solana_cluster_alpenglow_reward_lamports 10364546738\n"));
         assert!(text.contains(
@@ -856,6 +934,53 @@ mod tests {
             .find(|v| v.vote_pubkey.starts_with("CiHv"))
             .unwrap();
         assert!((cihv.blocks_produced - 90.0 * 347_671_486_449_531.0 / total).abs() < 1e-9);
+    }
+
+    #[test]
+    fn epoch_memory_freezes_last_sample_before_boundary() {
+        let v = |key: &str, inclusion: Option<f64>| ValidatorMetrics {
+            vote_pubkey: key.to_string(),
+            root_distance: 0,
+            vote_distance: 0,
+            credits_earned: 0,
+            activated_stake: 1,
+            rank: 0,
+            leader_slots: 0.0,
+            blocks_produced: 0.0,
+            voter_reward_lamports: None,
+            inclusion_relative: inclusion,
+        };
+        let mut memory = EpochMemory::default();
+        memory.observe(1042, &[v("A", Some(0.990)), v("B", None)]);
+        memory.observe(1042, &[v("A", Some(0.995)), v("B", Some(1.001))]);
+        assert_eq!(memory.previous(), None);
+        // First sample of the next epoch freezes the LAST sample of the old one.
+        memory.observe(1043, &[v("A", Some(0.5))]);
+        let frozen = memory.previous().unwrap();
+        assert_eq!(frozen.epoch, 1042);
+        assert_eq!(
+            frozen.inclusion_relative,
+            vec![("A".to_string(), 0.995), ("B".to_string(), 1.001)]
+        );
+        // A stale sample from a lagging RPC never overwrites or freezes anything.
+        memory.observe(1042, &[v("A", Some(0.1))]);
+        assert_eq!(memory.previous().unwrap().epoch, 1042);
+        memory.observe(1043, &[v("A", Some(0.7))]);
+        memory.observe(1044, &[]);
+        let frozen = memory.previous().unwrap();
+        assert_eq!(frozen.epoch, 1043);
+        assert_eq!(frozen.inclusion_relative, vec![("A".to_string(), 0.7)]);
+
+        let text = export_prometheus_metrics(vec![], None, memory.previous(), 0, 1, 0.1, 0);
+        assert!(text.contains("solana_validator_exporter_previous_epoch 1043\n"));
+        assert!(text.contains(
+            "solana_validator_alpenglow_inclusion_relative_previous_epoch{identity=\"A\"} 0.7\n"
+        ));
+        let text = export_prometheus_metrics(vec![], None, None, 0, 1, 0.1, 0);
+        assert!(text.contains("# TYPE solana_validator_exporter_previous_epoch gauge\n"));
+        assert!(!text
+            .lines()
+            .any(|l| l.starts_with("solana_validator_exporter_previous_epoch ")));
     }
 
     #[test]
@@ -1050,7 +1175,7 @@ mod tests {
         assert!(count > 0);
         assert_eq!(count, validators.len());
         assert!(validators.iter().any(|v| v.credits_earned > 0));
-        let output = export_prometheus_metrics(validators, model, count, 1, 0.0, 0);
+        let output = export_prometheus_metrics(validators, model, None, count, 1, 0.0, 0);
         assert!(output.contains("solana_validator_top_1 "));
         println!("Testnet epoch {epoch}: exported {count} validators with Alpenglow rewards");
     }
