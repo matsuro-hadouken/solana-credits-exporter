@@ -36,6 +36,7 @@ voting performance. Amounts are before reward distribution, not wallet balances.
 | `solana_validator_vote_distance` | Slots behind the highest current validator's reward-account `lastVote` |
 | `solana_validator_active` | RPC current account count, including zero-reward accounts |
 | `solana_validator_exporter_epoch` | Epoch of the successful sample |
+| `solana_validator_exporter_skipped_accounts` | Current accounts dropped from the sample for an inconsistent reward history (total below baseline); the rest of the cluster is still served |
 
 The existing `identity` label remains a **vote-account public key**, preserving
 existing queries. Update dashboard titles/units from credits to reward lamports

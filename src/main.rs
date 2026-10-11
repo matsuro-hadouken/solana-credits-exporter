@@ -242,7 +242,7 @@ struct MetricsCache {
 impl MetricsCache {
     fn new() -> Self {
         Self {
-            data: export_prometheus_metrics(vec![], None, None, 0, 0, 0.0, 0),
+            data: export_prometheus_metrics(vec![], None, None, 0, 0, 0, 0.0, 0),
         }
     }
 }
@@ -270,12 +270,27 @@ fn epoch_rewards(
     }
 }
 
+/// One successful sample of the cluster.
+#[derive(Debug, Clone)]
+struct Sample {
+    pub validators: Vec<ValidatorMetrics>,
+    /// RPC current accounts, including zero-reward and skipped ones.
+    pub active_count: usize,
+    /// Current accounts dropped from this sample because their reward history was
+    /// inconsistent (total below baseline). Never fatal for the other accounts.
+    pub skipped_accounts: usize,
+    pub model: Option<ClusterRewardModel>,
+}
+
 fn calculate_metrics(
     accounts: RpcVoteAccountStatus,
     production: Option<&RpcBlockProduction>,
     epoch: u64,
     migration_epoch: u64,
-) -> Result<(Vec<ValidatorMetrics>, usize, Option<ClusterRewardModel>), FetchError> {
+) -> Result<Sample, FetchError> {
+    if epoch < migration_epoch {
+        return Err("RPC epoch precedes Alpenglow migration".into());
+    }
     let top_root = accounts
         .current
         .iter()
@@ -323,8 +338,20 @@ fn calculate_metrics(
     });
 
     let mut validators = Vec::with_capacity(active_count);
+    let mut skipped_accounts = 0;
     for account in accounts.current {
-        let credits_earned = epoch_rewards(&account.epoch_credits, epoch, migration_epoch)?;
+        let credits_earned = match epoch_rewards(&account.epoch_credits, epoch, migration_epoch) {
+            Ok(credits) => credits,
+            Err(error) => {
+                // One account's bad history must not blank the whole cluster.
+                eprintln!(
+                    "Skipping vote account {} this sample: {error}",
+                    account.vote_pubkey
+                );
+                skipped_accounts += 1;
+                continue;
+            }
+        };
         let (leader_slots, blocks_produced) = apportioned
             .as_ref()
             .and_then(|m| m.get(&account.vote_pubkey).copied())
@@ -373,21 +400,18 @@ fn calculate_metrics(
             i + 1
         };
     }
-    Ok((validators, active_count, model))
+    Ok(Sample {
+        validators,
+        active_count,
+        skipped_accounts,
+        model,
+    })
 }
 
 async fn fetch_and_calculate_metrics(
     client: &RpcClient,
     migration_epoch: &mut Option<u64>,
-) -> Result<
-    (
-        Vec<ValidatorMetrics>,
-        usize,
-        u64,
-        Option<ClusterRewardModel>,
-    ),
-    FetchError,
-> {
+) -> Result<(Sample, u64), FetchError> {
     let migration = match *migration_epoch {
         Some(epoch) => epoch,
         None => {
@@ -420,9 +444,8 @@ async fn fetch_and_calculate_metrics(
     if before.epoch != after.epoch {
         return Err("epoch changed during RPC sample; retrying next poll".into());
     }
-    let (validators, count, model) =
-        calculate_metrics(accounts, Some(&production), after.epoch, migration)?;
-    Ok((validators, count, after.epoch, model))
+    let sample = calculate_metrics(accounts, Some(&production), after.epoch, migration)?;
+    Ok((sample, after.epoch))
 }
 
 fn export_prometheus_metrics(
@@ -430,6 +453,7 @@ fn export_prometheus_metrics(
     model: Option<ClusterRewardModel>,
     previous: Option<&EpochSnapshot>,
     active_count: usize,
+    skipped_accounts: usize,
     rpc_status: u8,
     rpc_duration: f64,
     rpc_timeout: u8,
@@ -639,6 +663,14 @@ fn export_prometheus_metrics(
     output.push_str("# TYPE solana_validator_active gauge\n");
     output.push_str(&format!("solana_validator_active {}\n", active_count));
 
+    // Accounts dropped from this sample for an inconsistent reward history
+    output.push_str("# HELP solana_validator_exporter_skipped_accounts RPC current accounts dropped from this sample because their reward history was inconsistent\n");
+    output.push_str("# TYPE solana_validator_exporter_skipped_accounts gauge\n");
+    output.push_str(&format!(
+        "solana_validator_exporter_skipped_accounts {}\n",
+        skipped_accounts
+    ));
+
     // RPC response status
     output.push_str("# HELP solana_validator_exporter_last_rpc_status RPC response status (1=success, 0=failure)\n");
     output.push_str("# TYPE solana_validator_exporter_last_rpc_status gauge\n");
@@ -703,6 +735,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
         let mut migration_epoch = None;
         let mut epoch_memory = EpochMemory::default();
+        // Log failures on change only: first occurrence, a different message, recovery.
+        let mut last_error: Option<String> = None;
 
         loop {
             let start = Instant::now();
@@ -713,14 +747,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // Only lock the cache when updating it
             let new_data = match result {
-                Ok(Ok((validator_metrics, active_count, epoch, model))) => {
+                Ok(Ok((sample, epoch))) => {
                     let duration = start.elapsed().as_secs_f64();
-                    epoch_memory.observe(epoch, &validator_metrics);
+                    if last_error.take().is_some() {
+                        eprintln!("RPC sampling recovered (epoch {epoch})");
+                    }
+                    epoch_memory.observe(epoch, &sample.validators);
                     let mut data = export_prometheus_metrics(
-                        validator_metrics,
-                        model,
+                        sample.validators,
+                        sample.model,
                         epoch_memory.previous(),
-                        active_count,
+                        sample.active_count,
+                        sample.skipped_accounts,
                         1,
                         duration,
                         0,
@@ -729,11 +767,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     data
                 }
                 Ok(Err(error)) => {
-                    eprintln!("Testnet RPC sample failed: {error}");
+                    let message = format!("RPC sample failed: {error}");
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("{message}");
+                        last_error = Some(message);
+                    }
                     export_prometheus_metrics(
                         vec![],
                         None,
                         epoch_memory.previous(),
+                        0,
                         0,
                         0,
                         start.elapsed().as_secs_f64(),
@@ -741,11 +784,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     )
                 }
                 Err(_) => {
-                    eprintln!("Testnet RPC sample timed out after 4.5 seconds");
+                    let message = "RPC sample timed out after 4.5 seconds".to_string();
+                    if last_error.as_deref() != Some(message.as_str()) {
+                        eprintln!("{message}");
+                        last_error = Some(message);
+                    }
                     export_prometheus_metrics(
                         vec![],
                         None,
                         epoch_memory.previous(),
+                        0,
                         0,
                         0,
                         start.elapsed().as_secs_f64(),
@@ -793,8 +841,13 @@ mod tests {
     fn migration_fixture_restores_accounts_without_tower_rewards() {
         let accounts =
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
-        let (validators, count, model) = calculate_metrics(accounts, None, 1042, 1042).unwrap();
-        assert_eq!(count, 2);
+        let Sample {
+            validators,
+            active_count: count,
+            skipped_accounts,
+            model,
+        } = calculate_metrics(accounts, None, 1042, 1042).unwrap();
+        assert_eq!((count, skipped_accounts), (2, 0));
         assert_eq!(model, None);
         // More raw lamports (5.44e9 on 347,671 SOL) ranks BELOW fewer lamports on less
         // stake (4.92e9 on 296,603 SOL): 15,649.6 vs 16,600.0 lamports per staked SOL.
@@ -806,7 +859,7 @@ mod tests {
         assert_eq!(validators[1].rank, 2);
         assert_eq!(validators[0].reward_per_sol(), Some(16600.029678075633));
         assert_eq!(validators[1].reward_per_sol(), Some(15649.622221147609));
-        let text = export_prometheus_metrics(validators, model, None, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, model, None, count, 0, 1, 0.2, 0);
         assert!(text.contains("solana_validator_active 2\n"));
         assert!(text.contains("solana_validator_top_1 16600.029678075633\n"));
         // Without block production the model gauges keep HELP/TYPE but carry no samples.
@@ -835,7 +888,12 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
         json["current"][0]["activatedStake"] = serde_json::json!(0);
         let accounts = serde_json::from_value(json).unwrap();
-        let (validators, count, model) = calculate_metrics(accounts, None, 1042, 1042).unwrap();
+        let Sample {
+            validators,
+            active_count: count,
+            model,
+            ..
+        } = calculate_metrics(accounts, None, 1042, 1042).unwrap();
         assert_eq!(count, 2);
         // The staked account ranks first; the zero-stake one is last with rank 0.
         assert_eq!(validators[0].rank, 1);
@@ -843,7 +901,7 @@ mod tests {
         assert_eq!(validators[1].rank, 0);
         assert_eq!(validators[1].activated_stake, 0);
         assert_eq!(validators[1].reward_per_sol(), None);
-        let text = export_prometheus_metrics(validators, model, None, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, model, None, count, 0, 1, 0.2, 0);
         assert_eq!(
             text.lines()
                 .filter(|l| l.starts_with("solana_validator_rating_position{"))
@@ -887,8 +945,9 @@ mod tests {
         }))
         .unwrap();
         // Gate: 36 blocks is below MIN_BLOCKS_FOR_MODEL -> no model, but counts still flow.
-        let (validators, _, model) =
-            calculate_metrics(accounts.clone(), Some(&production), 1042, 1042).unwrap();
+        let Sample {
+            validators, model, ..
+        } = calculate_metrics(accounts.clone(), Some(&production), 1042, 1042).unwrap();
         assert_eq!(model, None);
         assert!(validators
             .iter()
@@ -910,8 +969,9 @@ mod tests {
         production
             .by_identity
             .insert("unknownIdentity".to_string(), (1000, 1000));
-        let (validators, _, model) =
-            calculate_metrics(accounts, Some(&production), 1042, 1042).unwrap();
+        let Sample {
+            validators, model, ..
+        } = calculate_metrics(accounts, Some(&production), 1042, 1042).unwrap();
         let model = model.unwrap();
         assert_eq!(model.blocks_produced, 1036);
         assert_eq!(model.reward_lamports, 10_364_546_738);
@@ -956,7 +1016,7 @@ mod tests {
         ));
 
         let count = validators.len();
-        let text = export_prometheus_metrics(validators, Some(model), None, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, Some(model), None, count, 0, 1, 0.2, 0);
         assert!(text.contains("solana_cluster_alpenglow_blocks_produced 1036\n"));
         assert!(text.contains("solana_cluster_alpenglow_reward_lamports 10364546738\n"));
         assert!(text.contains(
@@ -997,7 +1057,7 @@ mod tests {
             "range": {"firstSlot": 0, "lastSlot": 0}
         }))
         .unwrap();
-        let (validators, _, _) =
+        let Sample { validators, .. } =
             calculate_metrics(accounts, Some(&production), 1042, 1042).unwrap();
         let total = 347_671_486_449_531.0 + 296_603_043_095_931.0;
         let slots: f64 = validators.iter().map(|v| v.leader_slots).sum();
@@ -1052,7 +1112,7 @@ mod tests {
             vec![("A".to_string(), 0.7, 0.25)]
         );
 
-        let text = export_prometheus_metrics(vec![], None, memory.previous(), 0, 1, 0.1, 0);
+        let text = export_prometheus_metrics(vec![], None, memory.previous(), 0, 0, 1, 0.1, 0);
         assert!(text.contains("solana_validator_exporter_previous_epoch 1043\n"));
         assert!(text.contains(
             "solana_validator_alpenglow_inclusion_relative_previous_epoch{identity=\"A\"} 0.7\n"
@@ -1060,7 +1120,7 @@ mod tests {
         assert!(text.contains(
             "solana_validator_alpenglow_stake_beaten_share_previous_epoch{identity=\"A\"} 0.25\n"
         ));
-        let text = export_prometheus_metrics(vec![], None, None, 0, 1, 0.1, 0);
+        let text = export_prometheus_metrics(vec![], None, None, 0, 0, 1, 0.1, 0);
         assert!(text.contains("# TYPE solana_validator_exporter_previous_epoch gauge\n"));
         assert!(!text
             .lines()
@@ -1104,6 +1164,41 @@ mod tests {
         assert_eq!(share("B"), Some(0.5)); // beats D + A: 50 of 100, tie with C
         assert_eq!(share("C"), Some(0.5));
         assert_eq!(share("E"), None);
+    }
+
+    #[test]
+    fn inconsistent_account_is_skipped_not_fatal() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        // Corrupt CiHv's current-epoch row: total below baseline.
+        json["current"][0]["epochCredits"][4] = serde_json::json!([1042, 1, 2273751687_u64]);
+        let accounts: RpcVoteAccountStatus = serde_json::from_value(json).unwrap();
+        let Sample {
+            validators,
+            active_count,
+            skipped_accounts,
+            ..
+        } = calculate_metrics(accounts, None, 1042, 1042).unwrap();
+        assert_eq!((active_count, skipped_accounts), (2, 1));
+        assert_eq!(validators.len(), 1);
+        assert!(validators[0].vote_pubkey.starts_with("9LjQ"));
+        assert_eq!(validators[0].rank, 1);
+        let text = export_prometheus_metrics(
+            validators,
+            None,
+            None,
+            active_count,
+            skipped_accounts,
+            1,
+            0.2,
+            0,
+        );
+        assert!(text.contains("solana_validator_active 2\n"));
+        assert!(text.contains("solana_validator_exporter_skipped_accounts 1\n"));
+        // A sample before the migration epoch is still rejected as a whole.
+        let accounts: RpcVoteAccountStatus =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        assert!(calculate_metrics(accounts, None, 1041, 1042).is_err());
     }
 
     #[test]
@@ -1163,7 +1258,11 @@ mod tests {
     fn epoch_rollover_keeps_current_accounts_and_ties_have_same_rank() {
         let accounts =
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
-        let (validators, count, _) = calculate_metrics(accounts, None, 1043, 1042).unwrap();
+        let Sample {
+            validators,
+            active_count: count,
+            ..
+        } = calculate_metrics(accounts, None, 1043, 1042).unwrap();
         assert_eq!(count, 2);
         assert!(validators
             .iter()
@@ -1289,17 +1388,24 @@ mod tests {
     async fn live_testnet_sample() {
         let client =
             RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
-        let (validators, count, epoch, model) = timeout(
+        let (sample, epoch) = timeout(
             Duration::from_secs_f32(4.5),
             fetch_and_calculate_metrics(&client, &mut None),
         )
         .await
         .unwrap()
         .unwrap();
+        let Sample {
+            validators,
+            active_count: count,
+            skipped_accounts,
+            model,
+        } = sample;
         assert!(count > 0);
-        assert_eq!(count, validators.len());
+        assert_eq!(count, validators.len() + skipped_accounts);
         assert!(validators.iter().any(|v| v.credits_earned > 0));
-        let output = export_prometheus_metrics(validators, model, None, count, 1, 0.0, 0);
+        let output =
+            export_prometheus_metrics(validators, model, None, count, skipped_accounts, 1, 0.0, 0);
         assert!(output.contains("solana_validator_top_1 "));
         println!("Testnet epoch {epoch}: exported {count} validators with Alpenglow rewards");
     }
