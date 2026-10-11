@@ -25,6 +25,10 @@ voting performance. Amounts are before reward distribution, not wallet balances.
 | `solana_validator_alpenglow_reward_per_sol` | Reward lamports divided by activated stake in SOL, both from the same `getVoteAccounts` response (atomic; no second call) |
 | `solana_validator_activated_stake_lamports` | Activated stake the runtime used for this epoch's rewards |
 | `solana_validator_rating_position` | Rank by reward per staked SOL; ties share a rank; zero-stake accounts are unranked |
+| `solana_validator_alpenglow_inclusion_relative` | Estimated voter reward per staked SOL relative to the stake-weighted cluster mean; 1.0 = included in reward certificates as often as the average stake. Leader lumps removed (see below) |
+| `solana_validator_alpenglow_voter_reward_lamports` | Estimated voter half of the epoch reward: total minus half the cluster-average reward per block times blocks produced |
+| `solana_validator_alpenglow_leader_slots`, `_blocks_produced` | Leader slots elapsed and blocks produced this epoch (`getBlockProduction`), apportioned by stake across vote accounts sharing an identity |
+| `solana_cluster_alpenglow_blocks_produced`, `_reward_lamports`, `_activated_stake_lamports`, `_reward_per_block_lamports`, `_voter_reward_per_sol` | Cluster sums behind the model (current plus delinquent accounts); absent until the epoch has 1,000 blocks |
 | `solana_validator_top_1`, `_top_100`, `_top_200` | Reward per staked SOL at that ranked position |
 | `solana_validator_root_distance` | Slots behind the highest current validator's final-certificate root |
 | `solana_validator_vote_distance` | Slots behind the highest current validator's reward-account `lastVote` |
@@ -35,6 +39,15 @@ The existing `identity` label remains a **vote-account public key**, preserving
 existing queries. Update dashboard titles/units from credits to reward lamports
 (or divide by `1e9` for SOL). Reward rank depends on stake and leader rewards;
 it must not be presented as the old voting-performance leaderboard.
+
+Leader-lump model: per block with a reward certificate the runtime pays every
+included validator `floor(pot * stake / total / 2)` and the block's leader the sum of
+the other halves (`runtime/src/block_component_processor/vote_reward.rs`). A
+validator's reward is therefore its smooth voter income plus one lump per block it
+produced. The exporter estimates the lumps as half of the cluster-average reward per
+block times the validator's blocks produced, subtracts them, and divides what is
+left by stake. Each sample is one `getBlockProduction` plus one `getVoteAccounts`
+call, bracketed by the epoch check.
 
 The exporter detects the migration epoch using `getAgGenesisCert` and
 `getEpochSchedule`, separates the migration history at its marker, and uses each

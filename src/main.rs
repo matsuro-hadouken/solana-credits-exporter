@@ -1,9 +1,12 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use solana_client::{
-    nonblocking::rpc_client::RpcClient, rpc_request::RpcRequest, rpc_response::RpcVoteAccountStatus,
+    nonblocking::rpc_client::RpcClient,
+    rpc_request::RpcRequest,
+    rpc_response::{RpcBlockProduction, RpcVoteAccountInfo, RpcVoteAccountStatus},
 };
 use solana_sdk::commitment_config::CommitmentConfig;
+use std::collections::HashMap;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -18,6 +21,9 @@ const MIGRATION_MARKER: (u64, u64, u64) = (u64::MAX, u64::MAX, u64::MAX);
 type FetchError = Box<dyn Error + Send + Sync>;
 
 const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
+/// Blocks the cluster must have produced this epoch before the leader-lump model is
+/// exported; below this the per-block average is too fresh to subtract safely.
+const MIN_BLOCKS_FOR_MODEL: u64 = 1_000;
 
 #[derive(Debug, Clone)]
 struct ValidatorMetrics {
@@ -29,6 +35,98 @@ struct ValidatorMetrics {
     pub activated_stake: u64,
     /// Rank by reward per staked SOL; 0 = unranked (no activated stake).
     pub rank: usize,
+    /// Leader slots elapsed this epoch, from getBlockProduction. Apportioned by stake
+    /// when one identity runs several vote accounts, hence fractional.
+    pub leader_slots: f64,
+    /// Blocks produced this epoch, same source and apportioning as `leader_slots`.
+    pub blocks_produced: f64,
+    /// Estimated voter half of `credits_earned`: total minus the leader lumps
+    /// (half of the cluster-average reward per block, times blocks produced).
+    pub voter_reward_lamports: Option<f64>,
+    /// Voter reward per staked SOL relative to the stake-weighted cluster mean.
+    /// 1.0 = included in reward certificates as often as the average stake.
+    pub inclusion_relative: Option<f64>,
+}
+
+/// Cluster-wide sums behind the leader-lump model, from one sample.
+///
+/// Per block with a reward certificate the runtime pays every included validator
+/// `floor(pot * stake / total / 2)` and the block's leader the sum of the other
+/// halves (`runtime/src/block_component_processor/vote_reward.rs`, v4.3.0). So a
+/// validator's leader income is half of the reward of each block it produced, and
+/// the cluster-average reward per block times blocks produced estimates it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClusterRewardModel {
+    /// Blocks produced this epoch by all identities, from getBlockProduction.
+    pub blocks_produced: u64,
+    /// Current-epoch reward lamports over current plus delinquent accounts.
+    pub reward_lamports: u64,
+    /// Activated stake over current plus delinquent accounts.
+    pub activated_stake: u64,
+    /// `reward_lamports / blocks_produced`.
+    pub reward_per_block: f64,
+    /// Voter half of all rewards per staked SOL: `reward_lamports / 2 / stake_sol`.
+    pub voter_reward_per_sol: f64,
+}
+
+impl ClusterRewardModel {
+    fn new(blocks_produced: u64, reward_lamports: u64, activated_stake: u64) -> Option<Self> {
+        if blocks_produced < MIN_BLOCKS_FOR_MODEL || reward_lamports == 0 || activated_stake == 0 {
+            return None;
+        }
+        let reward_per_block = reward_lamports as f64 / blocks_produced as f64;
+        let voter_reward_per_sol =
+            reward_lamports as f64 / 2.0 * LAMPORTS_PER_SOL as f64 / activated_stake as f64;
+        Some(Self {
+            blocks_produced,
+            reward_lamports,
+            activated_stake,
+            reward_per_block,
+            voter_reward_per_sol,
+        })
+    }
+
+    /// Estimated leader income for `blocks` blocks produced.
+    fn leader_lamports(&self, blocks: f64) -> f64 {
+        self.reward_per_block / 2.0 * blocks
+    }
+}
+
+/// Leader slots and blocks produced per vote account, apportioned by stake across the
+/// vote accounts that share an identity (nearly always exactly one).
+fn apportion_block_production(
+    production: &RpcBlockProduction,
+    accounts: &[&RpcVoteAccountInfo],
+) -> HashMap<String, (f64, f64)> {
+    let mut by_node: HashMap<&str, Vec<&RpcVoteAccountInfo>> = HashMap::new();
+    for &account in accounts {
+        by_node
+            .entry(account.node_pubkey.as_str())
+            .or_default()
+            .push(account);
+    }
+    let mut result = HashMap::new();
+    for (node, (slots, produced)) in &production.by_identity {
+        let Some(vote_accounts) = by_node.get(node.as_str()) else {
+            continue;
+        };
+        let total_stake: u128 = vote_accounts
+            .iter()
+            .map(|a| a.activated_stake as u128)
+            .sum();
+        for account in vote_accounts {
+            let share = if total_stake == 0 {
+                1.0 / vote_accounts.len() as f64
+            } else {
+                account.activated_stake as f64 / total_stake as f64
+            };
+            result.insert(
+                account.vote_pubkey.clone(),
+                (*slots as f64 * share, *produced as f64 * share),
+            );
+        }
+    }
+    result
 }
 
 impl ValidatorMetrics {
@@ -64,7 +162,7 @@ struct MetricsCache {
 impl MetricsCache {
     fn new() -> Self {
         Self {
-            data: export_prometheus_metrics(vec![], 0, 0, 0.0, 0),
+            data: export_prometheus_metrics(vec![], None, 0, 0, 0.0, 0),
         }
     }
 }
@@ -94,9 +192,10 @@ fn epoch_rewards(
 
 fn calculate_metrics(
     accounts: RpcVoteAccountStatus,
+    production: Option<&RpcBlockProduction>,
     epoch: u64,
     migration_epoch: u64,
-) -> Result<(Vec<ValidatorMetrics>, usize), FetchError> {
+) -> Result<(Vec<ValidatorMetrics>, usize, Option<ClusterRewardModel>), FetchError> {
     let top_root = accounts
         .current
         .iter()
@@ -110,15 +209,66 @@ fn calculate_metrics(
         .max()
         .unwrap_or(0);
     let active_count = accounts.current.len();
+
+    // Leader-lump model inputs. Cluster sums span current AND delinquent accounts:
+    // both hold epoch stake and both may have produced blocks this epoch. A delinquent
+    // account's history is taken as-is (zero on any inconsistency), never fatal.
+    let model = production.and_then(|production| {
+        let blocks: u64 = production
+            .by_identity
+            .values()
+            .map(|(_, produced)| *produced as u64)
+            .sum();
+        let reward: u64 = accounts
+            .current
+            .iter()
+            .chain(accounts.delinquent.iter())
+            .map(|a| epoch_rewards(&a.epoch_credits, epoch, migration_epoch).unwrap_or(0))
+            .fold(0u64, u64::saturating_add);
+        let stake: u64 = accounts
+            .current
+            .iter()
+            .chain(accounts.delinquent.iter())
+            .map(|a| a.activated_stake)
+            .fold(0u64, u64::saturating_add);
+        ClusterRewardModel::new(blocks, reward, stake)
+    });
+    let apportioned = production.map(|production| {
+        let all: Vec<&RpcVoteAccountInfo> = accounts
+            .current
+            .iter()
+            .chain(accounts.delinquent.iter())
+            .collect();
+        apportion_block_production(production, &all)
+    });
+
     let mut validators = Vec::with_capacity(active_count);
     for account in accounts.current {
+        let credits_earned = epoch_rewards(&account.epoch_credits, epoch, migration_epoch)?;
+        let (leader_slots, blocks_produced) = apportioned
+            .as_ref()
+            .and_then(|m| m.get(&account.vote_pubkey).copied())
+            .unwrap_or((0.0, 0.0));
+        let voter_reward_lamports = model
+            .map(|model| (credits_earned as f64 - model.leader_lamports(blocks_produced)).max(0.0));
+        let inclusion_relative = match (voter_reward_lamports, model) {
+            (Some(voter), Some(model)) if account.activated_stake > 0 => {
+                let per_sol = voter * LAMPORTS_PER_SOL as f64 / account.activated_stake as f64;
+                Some(per_sol / model.voter_reward_per_sol)
+            }
+            _ => None,
+        };
         validators.push(ValidatorMetrics {
             vote_pubkey: account.vote_pubkey,
             root_distance: top_root.saturating_sub(account.root_slot),
             vote_distance: top_vote.saturating_sub(account.last_vote),
-            credits_earned: epoch_rewards(&account.epoch_credits, epoch, migration_epoch)?,
+            credits_earned,
             activated_stake: account.activated_stake,
             rank: 0,
+            leader_slots,
+            blocks_produced,
+            voter_reward_lamports,
+            inclusion_relative,
         });
     }
     // Staked accounts first, ordered by reward per staked SOL (exact, no floats);
@@ -141,13 +291,21 @@ fn calculate_metrics(
             i + 1
         };
     }
-    Ok((validators, active_count))
+    Ok((validators, active_count, model))
 }
 
 async fn fetch_and_calculate_metrics(
     client: &RpcClient,
     migration_epoch: &mut Option<u64>,
-) -> Result<(Vec<ValidatorMetrics>, usize, u64), FetchError> {
+) -> Result<
+    (
+        Vec<ValidatorMetrics>,
+        usize,
+        u64,
+        Option<ClusterRewardModel>,
+    ),
+    FetchError,
+> {
     let migration = match *migration_epoch {
         Some(epoch) => epoch,
         None => {
@@ -171,17 +329,23 @@ async fn fetch_and_calculate_metrics(
         }
     };
     let before = client.get_epoch_info().await?;
+    // Block production first, then vote accounts: a leader block landing between the
+    // two calls then shows in credits but not yet in blocks, which only understates
+    // the leader lump for one sample. The epoch check below brackets both.
+    let production = client.get_block_production().await?.value;
     let accounts = client.get_vote_accounts().await?;
     let after = client.get_epoch_info().await?;
     if before.epoch != after.epoch {
         return Err("epoch changed during RPC sample; retrying next poll".into());
     }
-    let (validators, count) = calculate_metrics(accounts, after.epoch, migration)?;
-    Ok((validators, count, after.epoch))
+    let (validators, count, model) =
+        calculate_metrics(accounts, Some(&production), after.epoch, migration)?;
+    Ok((validators, count, after.epoch, model))
 }
 
 fn export_prometheus_metrics(
     validators: Vec<ValidatorMetrics>,
+    model: Option<ClusterRewardModel>,
     active_count: usize,
     rpc_status: u8,
     rpc_duration: f64,
@@ -218,6 +382,81 @@ fn export_prometheus_metrics(
         output.push_str(&format!(
             "solana_validator_activated_stake_lamports{{identity=\"{}\"}} {}\n",
             validator.vote_pubkey, validator.activated_stake
+        ));
+    }
+
+    // Leader-lump model, per validator: leader slots, blocks, voter-only reward, inclusion
+    output.push_str("# HELP solana_validator_alpenglow_leader_slots Leader slots elapsed this epoch (getBlockProduction), apportioned by stake across vote accounts sharing an identity\n");
+    output.push_str("# TYPE solana_validator_alpenglow_leader_slots gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_alpenglow_leader_slots{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.leader_slots
+        ));
+    }
+
+    output.push_str("# HELP solana_validator_alpenglow_blocks_produced Blocks produced this epoch (getBlockProduction), apportioned by stake across vote accounts sharing an identity\n");
+    output.push_str("# TYPE solana_validator_alpenglow_blocks_produced gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_alpenglow_blocks_produced{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.blocks_produced
+        ));
+    }
+
+    output.push_str("# HELP solana_validator_alpenglow_voter_reward_lamports Estimated voter half of current-epoch reward: total minus half the cluster-average reward per block times blocks produced\n");
+    output.push_str("# TYPE solana_validator_alpenglow_voter_reward_lamports gauge\n");
+    for validator in &validators {
+        if let Some(voter) = validator.voter_reward_lamports {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_voter_reward_lamports{{identity=\"{}\"}} {}\n",
+                validator.vote_pubkey, voter
+            ));
+        }
+    }
+
+    output.push_str("# HELP solana_validator_alpenglow_inclusion_relative Estimated voter reward per staked SOL relative to the stake-weighted cluster mean; 1.0 = included in reward certificates as often as the average stake\n");
+    output.push_str("# TYPE solana_validator_alpenglow_inclusion_relative gauge\n");
+    for validator in &validators {
+        if let Some(inclusion) = validator.inclusion_relative {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_inclusion_relative{{identity=\"{}\"}} {}\n",
+                validator.vote_pubkey, inclusion
+            ));
+        }
+    }
+
+    // Leader-lump model, cluster level (absent until the epoch has enough blocks)
+    output.push_str("# HELP solana_cluster_alpenglow_blocks_produced Blocks produced this epoch by all identities (getBlockProduction)\n");
+    output.push_str("# TYPE solana_cluster_alpenglow_blocks_produced gauge\n");
+    output.push_str("# HELP solana_cluster_alpenglow_reward_lamports Current-epoch reward lamports summed over current and delinquent vote accounts\n");
+    output.push_str("# TYPE solana_cluster_alpenglow_reward_lamports gauge\n");
+    output.push_str("# HELP solana_cluster_alpenglow_activated_stake_lamports Activated stake summed over current and delinquent vote accounts\n");
+    output.push_str("# TYPE solana_cluster_alpenglow_activated_stake_lamports gauge\n");
+    output.push_str("# HELP solana_cluster_alpenglow_reward_per_block_lamports Cluster reward lamports divided by blocks produced this epoch; half of it is one block's leader income\n");
+    output.push_str("# TYPE solana_cluster_alpenglow_reward_per_block_lamports gauge\n");
+    output.push_str("# HELP solana_cluster_alpenglow_voter_reward_per_sol Voter half of all cluster rewards per staked SOL; denominator of solana_validator_alpenglow_inclusion_relative\n");
+    output.push_str("# TYPE solana_cluster_alpenglow_voter_reward_per_sol gauge\n");
+    if let Some(model) = model {
+        output.push_str(&format!(
+            "solana_cluster_alpenglow_blocks_produced {}\n",
+            model.blocks_produced
+        ));
+        output.push_str(&format!(
+            "solana_cluster_alpenglow_reward_lamports {}\n",
+            model.reward_lamports
+        ));
+        output.push_str(&format!(
+            "solana_cluster_alpenglow_activated_stake_lamports {}\n",
+            model.activated_stake
+        ));
+        output.push_str(&format!(
+            "solana_cluster_alpenglow_reward_per_block_lamports {}\n",
+            model.reward_per_block
+        ));
+        output.push_str(&format!(
+            "solana_cluster_alpenglow_voter_reward_per_sol {}\n",
+            model.voter_reward_per_sol
         ));
     }
 
@@ -351,20 +590,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // Only lock the cache when updating it
             let new_data = match result {
-                Ok(Ok((validator_metrics, active_count, epoch))) => {
+                Ok(Ok((validator_metrics, active_count, epoch, model))) => {
                     let duration = start.elapsed().as_secs_f64();
-                    let mut data =
-                        export_prometheus_metrics(validator_metrics, active_count, 1, duration, 0);
+                    let mut data = export_prometheus_metrics(
+                        validator_metrics,
+                        model,
+                        active_count,
+                        1,
+                        duration,
+                        0,
+                    );
                     data.push_str(&format!("# HELP solana_validator_exporter_epoch Epoch of this successful sample\n# TYPE solana_validator_exporter_epoch gauge\nsolana_validator_exporter_epoch {}\n", epoch));
                     data
                 }
                 Ok(Err(error)) => {
                     eprintln!("Testnet RPC sample failed: {error}");
-                    export_prometheus_metrics(vec![], 0, 0, start.elapsed().as_secs_f64(), 0)
+                    export_prometheus_metrics(vec![], None, 0, 0, start.elapsed().as_secs_f64(), 0)
                 }
                 Err(_) => {
                     eprintln!("Testnet RPC sample timed out after 4.5 seconds");
-                    export_prometheus_metrics(vec![], 0, 0, start.elapsed().as_secs_f64(), 1)
+                    export_prometheus_metrics(vec![], None, 0, 0, start.elapsed().as_secs_f64(), 1)
                 }
             };
 
@@ -407,8 +652,9 @@ mod tests {
     fn migration_fixture_restores_accounts_without_tower_rewards() {
         let accounts =
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
-        let (validators, count) = calculate_metrics(accounts, 1042, 1042).unwrap();
+        let (validators, count, model) = calculate_metrics(accounts, None, 1042, 1042).unwrap();
         assert_eq!(count, 2);
+        assert_eq!(model, None);
         // More raw lamports (5.44e9 on 347,671 SOL) ranks BELOW fewer lamports on less
         // stake (4.92e9 on 296,603 SOL): 15,649.6 vs 16,600.0 lamports per staked SOL.
         assert_eq!(validators[0].credits_earned, 4_923_619_318);
@@ -419,9 +665,17 @@ mod tests {
         assert_eq!(validators[1].rank, 2);
         assert_eq!(validators[0].reward_per_sol(), Some(16600.029678075633));
         assert_eq!(validators[1].reward_per_sol(), Some(15649.622221147609));
-        let text = export_prometheus_metrics(validators, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, model, count, 1, 0.2, 0);
         assert!(text.contains("solana_validator_active 2\n"));
         assert!(text.contains("solana_validator_top_1 16600.029678075633\n"));
+        // Without block production the model gauges keep HELP/TYPE but carry no samples.
+        assert!(text.contains("# TYPE solana_cluster_alpenglow_blocks_produced gauge\n"));
+        assert!(!text
+            .lines()
+            .any(|l| l.starts_with("solana_cluster_alpenglow_") && !l.starts_with('#')));
+        assert!(!text
+            .lines()
+            .any(|l| l.starts_with("solana_validator_alpenglow_inclusion_relative{")));
         assert!(text.contains("solana_validator_alpenglow_reward_per_sol{identity=\"9LjQ5UC1"));
         assert!(text.contains(
             "solana_validator_activated_stake_lamports{identity=\"CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D\"} 347671486449531\n"
@@ -440,7 +694,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
         json["current"][0]["activatedStake"] = serde_json::json!(0);
         let accounts = serde_json::from_value(json).unwrap();
-        let (validators, count) = calculate_metrics(accounts, 1042, 1042).unwrap();
+        let (validators, count, model) = calculate_metrics(accounts, None, 1042, 1042).unwrap();
         assert_eq!(count, 2);
         // The staked account ranks first; the zero-stake one is last with rank 0.
         assert_eq!(validators[0].rank, 1);
@@ -448,7 +702,7 @@ mod tests {
         assert_eq!(validators[1].rank, 0);
         assert_eq!(validators[1].activated_stake, 0);
         assert_eq!(validators[1].reward_per_sol(), None);
-        let text = export_prometheus_metrics(validators, count, 1, 0.2, 0);
+        let text = export_prometheus_metrics(validators, model, count, 1, 0.2, 0);
         assert_eq!(
             text.lines()
                 .filter(|l| l.starts_with("solana_validator_rating_position{"))
@@ -476,6 +730,135 @@ mod tests {
     }
 
     #[test]
+    fn leader_lump_model_matches_hand_computation() {
+        // Fixture: CiHv (Txh6…, 347,671 SOL, 5.44e9 lamports), 9LjQ (vyRa…, 296,603 SOL,
+        // 4.92e9), delinquent pitR (3muw…, 319,591 SOL, 0). Blocks 20 / 16 / 0.
+        // MIN_BLOCKS_FOR_MODEL is scaled by 1000 unknown-identity blocks so the gate opens.
+        let accounts: RpcVoteAccountStatus =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        let production: RpcBlockProduction = serde_json::from_value(serde_json::json!({
+            "byIdentity": {
+                "Txh6mKsvA8rwesigHzALTiFggyrkGDVtMP2vicuepAy": [20, 20],
+                "vyRa8J7ULHfUAdnkTHP3YGhcLWaLURXLmD7CiZkMzWg": [16, 16],
+                "3muw1JVkkBJoSA3F4qScCvLgTVCpP3wHEXjCtkiq277w": [4, 0]
+            },
+            "range": {"firstSlot": 444620256, "lastSlot": 444630541}
+        }))
+        .unwrap();
+        // Gate: 36 blocks is below MIN_BLOCKS_FOR_MODEL -> no model, but counts still flow.
+        let (validators, _, model) =
+            calculate_metrics(accounts.clone(), Some(&production), 1042, 1042).unwrap();
+        assert_eq!(model, None);
+        assert!(validators
+            .iter()
+            .all(|v| v.inclusion_relative.is_none() && v.voter_reward_lamports.is_none()));
+        let cihv = validators
+            .iter()
+            .find(|v| v.vote_pubkey.starts_with("CiHv"))
+            .unwrap();
+        assert_eq!((cihv.leader_slots, cihv.blocks_produced), (20.0, 20.0));
+
+        // Open the gate with an identity that has no vote account: its blocks count in the
+        // cluster total but map to nobody. Hand-computed with the same arithmetic:
+        //   B = 1036, sumC = 10_364_546_738, sumS = 963_865_814_675_954
+        //   reward_per_block = sumC / B
+        //   voter(v) = C(v) - reward_per_block / 2 * blocks(v)
+        //   cluster_voter_per_sol = sumC / 2 * 1e9 / sumS
+        //   inclusion(v) = (voter(v) * 1e9 / S(v)) / cluster_voter_per_sol
+        let mut production = production;
+        production
+            .by_identity
+            .insert("unknownIdentity".to_string(), (1000, 1000));
+        let (validators, _, model) =
+            calculate_metrics(accounts, Some(&production), 1042, 1042).unwrap();
+        let model = model.unwrap();
+        assert_eq!(model.blocks_produced, 1036);
+        assert_eq!(model.reward_lamports, 10_364_546_738);
+        assert_eq!(model.activated_stake, 963_865_814_675_954);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(1.0);
+        assert!(close(model.reward_per_block, 10_364_546_738.0 / 1036.0));
+        assert!(close(
+            model.voter_reward_per_sol,
+            10_364_546_738.0 / 2.0 * 1e9 / 963_865_814_675_954.0
+        ));
+        let cihv = validators
+            .iter()
+            .find(|v| v.vote_pubkey.starts_with("CiHv"))
+            .unwrap();
+        let ljq = validators
+            .iter()
+            .find(|v| v.vote_pubkey.starts_with("9LjQ"))
+            .unwrap();
+        let voter_cihv = 5_440_927_420.0 - model.reward_per_block / 2.0 * 20.0;
+        let voter_ljq = 4_923_619_318.0 - model.reward_per_block / 2.0 * 16.0;
+        assert!(close(cihv.voter_reward_lamports.unwrap(), voter_cihv));
+        assert!(close(ljq.voter_reward_lamports.unwrap(), voter_ljq));
+        assert!(close(
+            cihv.inclusion_relative.unwrap(),
+            (voter_cihv * 1e9 / 347_671_486_449_531.0) / model.voter_reward_per_sol
+        ));
+        assert!(close(
+            ljq.inclusion_relative.unwrap(),
+            (voter_ljq * 1e9 / 296_603_043_095_931.0) / model.voter_reward_per_sol
+        ));
+        // The delinquent third of the stake earned nothing, so both active accounts sit
+        // above the stake-weighted mean.
+        assert!(cihv.inclusion_relative.unwrap() > 1.0);
+        assert!(ljq.inclusion_relative.unwrap() > 1.0);
+
+        let count = validators.len();
+        let text = export_prometheus_metrics(validators, Some(model), count, 1, 0.2, 0);
+        assert!(text.contains("solana_cluster_alpenglow_blocks_produced 1036\n"));
+        assert!(text.contains("solana_cluster_alpenglow_reward_lamports 10364546738\n"));
+        assert!(text.contains(
+            "solana_validator_alpenglow_blocks_produced{identity=\"CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D\"} 20\n"
+        ));
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("solana_validator_alpenglow_inclusion_relative{"))
+                .count(),
+            2
+        );
+        // Every gauge name appears in exactly one HELP and one TYPE line.
+        let mut names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("# TYPE "))
+            .filter_map(|l| l.split(' ').next())
+            .collect();
+        let unique = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(unique, names.len());
+        // No NaN or inf anywhere in the exposition.
+        assert!(!text.contains("NaN") && !text.contains("inf"));
+    }
+
+    #[test]
+    fn leader_lump_model_apportions_shared_identity_by_stake() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        // Make both current accounts share one identity: 347,671 vs 296,603 SOL.
+        json["current"][1]["nodePubkey"] = json["current"][0]["nodePubkey"].clone();
+        let accounts: RpcVoteAccountStatus = serde_json::from_value(json).unwrap();
+        let production: RpcBlockProduction = serde_json::from_value(serde_json::json!({
+            "byIdentity": {"Txh6mKsvA8rwesigHzALTiFggyrkGDVtMP2vicuepAy": [100, 90]},
+            "range": {"firstSlot": 0, "lastSlot": 0}
+        }))
+        .unwrap();
+        let (validators, _, _) =
+            calculate_metrics(accounts, Some(&production), 1042, 1042).unwrap();
+        let total = 347_671_486_449_531.0 + 296_603_043_095_931.0;
+        let slots: f64 = validators.iter().map(|v| v.leader_slots).sum();
+        let blocks: f64 = validators.iter().map(|v| v.blocks_produced).sum();
+        assert!((slots - 100.0).abs() < 1e-9 && (blocks - 90.0).abs() < 1e-9);
+        let cihv = validators
+            .iter()
+            .find(|v| v.vote_pubkey.starts_with("CiHv"))
+            .unwrap();
+        assert!((cihv.blocks_produced - 90.0 * 347_671_486_449_531.0 / total).abs() < 1e-9);
+    }
+
+    #[test]
     fn reward_per_stake_order_is_exact() {
         let v = |credits, stake| ValidatorMetrics {
             vote_pubkey: String::new(),
@@ -484,6 +867,10 @@ mod tests {
             credits_earned: credits,
             activated_stake: stake,
             rank: 0,
+            leader_slots: 0.0,
+            blocks_produced: 0.0,
+            voter_reward_lamports: None,
+            inclusion_relative: None,
         };
         // 3/2 > 4/3 ; 2/4 == 1/2 ; u64::MAX cross products must not overflow.
         assert_eq!(
@@ -527,7 +914,7 @@ mod tests {
     fn epoch_rollover_keeps_current_accounts_and_ties_have_same_rank() {
         let accounts =
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
-        let (validators, count) = calculate_metrics(accounts, 1043, 1042).unwrap();
+        let (validators, count, _) = calculate_metrics(accounts, None, 1043, 1042).unwrap();
         assert_eq!(count, 2);
         assert!(validators
             .iter()
@@ -610,8 +997,15 @@ mod tests {
         };
         let accounts =
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
-        let (client, server) =
-            mock_rpc(vec![epoch(1042), accounts, epoch(1043)], Duration::ZERO).await;
+        let production = serde_json::json!({
+            "context": {"slot": 444620256},
+            "value": {"byIdentity": {}, "range": {"firstSlot": 0, "lastSlot": 0}}
+        });
+        let (client, server) = mock_rpc(
+            vec![epoch(1042), production, accounts, epoch(1043)],
+            Duration::ZERO,
+        )
+        .await;
         let result = fetch_and_calculate_metrics(&client, &mut Some(1042)).await;
         server.abort();
         let error = result.unwrap_err().to_string();
@@ -646,7 +1040,7 @@ mod tests {
     async fn live_testnet_sample() {
         let client =
             RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
-        let (validators, count, epoch) = timeout(
+        let (validators, count, epoch, model) = timeout(
             Duration::from_secs_f32(4.5),
             fetch_and_calculate_metrics(&client, &mut None),
         )
@@ -656,7 +1050,7 @@ mod tests {
         assert!(count > 0);
         assert_eq!(count, validators.len());
         assert!(validators.iter().any(|v| v.credits_earned > 0));
-        let output = export_prometheus_metrics(validators, count, 1, 0.0, 0);
+        let output = export_prometheus_metrics(validators, model, count, 1, 0.0, 0);
         assert!(output.contains("solana_validator_top_1 "));
         println!("Testnet epoch {epoch}: exported {count} validators with Alpenglow rewards");
     }
