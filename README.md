@@ -22,8 +22,10 @@ voting performance. Amounts are before reward distribution, not wallet balances.
 | --- | --- |
 | `solana_validator_alpenglow_rewards_lamports` | Current-epoch Alpenglow voter plus leader reward lamports |
 | `solana_validator_credits_so_far` | Compatibility alias for the same reward amount |
-| `solana_validator_rating_position` | Rank by raw reward amount; ties share a rank |
-| `solana_validator_top_1`, `_top_100`, `_top_200` | Reward amount at that sorted position |
+| `solana_validator_alpenglow_reward_per_sol` | Reward lamports divided by activated stake in SOL, both from the same `getVoteAccounts` response (atomic; no second call) |
+| `solana_validator_activated_stake_lamports` | Activated stake the runtime used for this epoch's rewards |
+| `solana_validator_rating_position` | Rank by reward per staked SOL; ties share a rank; zero-stake accounts are unranked |
+| `solana_validator_top_1`, `_top_100`, `_top_200` | Reward per staked SOL at that ranked position |
 | `solana_validator_root_distance` | Slots behind the highest current validator's final-certificate root |
 | `solana_validator_vote_distance` | Slots behind the highest current validator's reward-account `lastVote` |
 | `solana_validator_active` | RPC current account count, including zero-reward accounts |

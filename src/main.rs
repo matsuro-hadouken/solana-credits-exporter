@@ -17,13 +17,43 @@ const RPC_URL: &str = "https://api.testnet.solana.com";
 const MIGRATION_MARKER: (u64, u64, u64) = (u64::MAX, u64::MAX, u64::MAX);
 type FetchError = Box<dyn Error + Send + Sync>;
 
+const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
+
 #[derive(Debug, Clone)]
 struct ValidatorMetrics {
     pub vote_pubkey: String,
     pub root_distance: u64,
     pub vote_distance: u64,
     pub credits_earned: u64,
+    /// Stake the runtime used for this epoch's rewards, from the same RPC response.
+    pub activated_stake: u64,
+    /// Rank by reward per staked SOL; 0 = unranked (no activated stake).
     pub rank: usize,
+}
+
+impl ValidatorMetrics {
+    /// Reward lamports earned per staked SOL this epoch. Alpenglow pays each included
+    /// slot as `pot * stake / total_stake`, so the raw lamport total is a stake table;
+    /// dividing by the stake that earned it leaves inclusion performance.
+    fn reward_per_sol(&self) -> Option<f64> {
+        if self.activated_stake == 0 {
+            return None;
+        }
+        Some(self.credits_earned as f64 * LAMPORTS_PER_SOL as f64 / self.activated_stake as f64)
+    }
+}
+
+/// Exact descending order of `credits / stake` without floats: compares cross products.
+fn cmp_reward_per_stake(a: &ValidatorMetrics, b: &ValidatorMetrics) -> std::cmp::Ordering {
+    // a.credits/a.stake > b.credits/b.stake  <=>  a.credits*b.stake > b.credits*a.stake.
+    // Descending order: a sorts first (Ordering::Less) when its ratio is the larger one.
+    let a_cross = a.credits_earned as u128 * b.activated_stake as u128;
+    let b_cross = b.credits_earned as u128 * a.activated_stake as u128;
+    b_cross.cmp(&a_cross)
+}
+
+fn same_reward_per_stake(a: &ValidatorMetrics, b: &ValidatorMetrics) -> bool {
+    cmp_reward_per_stake(a, b) == std::cmp::Ordering::Equal
 }
 
 #[derive(Debug, Clone)]
@@ -87,22 +117,29 @@ fn calculate_metrics(
             root_distance: top_root.saturating_sub(account.root_slot),
             vote_distance: top_vote.saturating_sub(account.last_vote),
             credits_earned: epoch_rewards(&account.epoch_credits, epoch, migration_epoch)?,
+            activated_stake: account.activated_stake,
             rank: 0,
         });
     }
+    // Staked accounts first, ordered by reward per staked SOL (exact, no floats);
+    // zero-stake accounts last, unranked. Pubkey keeps output order deterministic.
     validators.sort_by(|a, b| {
-        b.credits_earned
-            .cmp(&a.credits_earned)
+        (a.activated_stake == 0)
+            .cmp(&(b.activated_stake == 0))
+            .then_with(|| cmp_reward_per_stake(a, b))
             .then_with(|| a.vote_pubkey.cmp(&b.vote_pubkey))
     });
-    // Equal rewards share a rank; pubkey keeps output order deterministic.
+    // Equal reward-per-stake shares a rank.
     for i in 0..validators.len() {
-        validators[i].rank =
-            if i > 0 && validators[i].credits_earned == validators[i - 1].credits_earned {
-                validators[i - 1].rank
-            } else {
-                i + 1
-            };
+        if validators[i].activated_stake == 0 {
+            validators[i].rank = 0;
+            continue;
+        }
+        validators[i].rank = if i > 0 && same_reward_per_stake(&validators[i], &validators[i - 1]) {
+            validators[i - 1].rank
+        } else {
+            i + 1
+        };
     }
     Ok((validators, active_count))
 }
@@ -152,13 +189,35 @@ fn export_prometheus_metrics(
 ) -> String {
     let mut output = String::new();
 
-    // Rating position for each validator (Rank)
-    output.push_str("# HELP solana_validator_rating_position Rank by current-epoch Alpenglow reward lamports (voter plus leader, not voting performance)\n");
+    // Rating position for each staked validator (Rank by reward per staked SOL)
+    output.push_str("# HELP solana_validator_rating_position Rank by current-epoch Alpenglow reward lamports per staked SOL (voter plus leader); zero-stake accounts are unranked\n");
     output.push_str("# TYPE solana_validator_rating_position gauge\n");
-    for validator in &validators {
+    for validator in validators.iter().filter(|v| v.rank > 0) {
         output.push_str(&format!(
             "solana_validator_rating_position{{identity=\"{}\"}} {}\n",
             validator.vote_pubkey, validator.rank
+        ));
+    }
+
+    // Reward per staked SOL for each staked validator
+    output.push_str("# HELP solana_validator_alpenglow_reward_per_sol Current-epoch accrued reward lamports divided by activated stake in SOL, from one getVoteAccounts response\n");
+    output.push_str("# TYPE solana_validator_alpenglow_reward_per_sol gauge\n");
+    for validator in &validators {
+        if let Some(per_sol) = validator.reward_per_sol() {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_reward_per_sol{{identity=\"{}\"}} {}\n",
+                validator.vote_pubkey, per_sol
+            ));
+        }
+    }
+
+    // Activated stake for each validator
+    output.push_str("# HELP solana_validator_activated_stake_lamports Stake delegated to the vote account for the current epoch, in lamports\n");
+    output.push_str("# TYPE solana_validator_activated_stake_lamports gauge\n");
+    for validator in &validators {
+        output.push_str(&format!(
+            "solana_validator_activated_stake_lamports{{identity=\"{}\"}} {}\n",
+            validator.vote_pubkey, validator.activated_stake
         ));
     }
 
@@ -201,32 +260,17 @@ fn export_prometheus_metrics(
         ));
     }
 
-    // Top validator metrics
-    output.push_str("# HELP solana_validator_top_1 Alpenglow reward lamports at sorted position 1 (not voting performance)\n");
-    output.push_str("# TYPE solana_validator_top_1 gauge\n");
-    if let Some(top_1) = validators.first() {
+    // Top validator metrics: reward per staked SOL at ranked positions (staked accounts only)
+    let ranked: Vec<&ValidatorMetrics> = validators.iter().filter(|v| v.rank > 0).collect();
+    for (name, position) in [("top_1", 0usize), ("top_100", 99), ("top_200", 199)] {
         output.push_str(&format!(
-            "solana_validator_top_1 {}\n",
-            top_1.credits_earned
+            "# HELP solana_validator_{name} Alpenglow reward lamports per staked SOL at ranked position {}\n",
+            position + 1
         ));
-    }
-
-    output.push_str("# HELP solana_validator_top_100 Alpenglow reward lamports at sorted position 100 (not voting performance)\n");
-    output.push_str("# TYPE solana_validator_top_100 gauge\n");
-    if let Some(top_100) = validators.get(99) {
-        output.push_str(&format!(
-            "solana_validator_top_100 {}\n",
-            top_100.credits_earned
-        ));
-    }
-
-    output.push_str("# HELP solana_validator_top_200 Alpenglow reward lamports at sorted position 200 (not voting performance)\n");
-    output.push_str("# TYPE solana_validator_top_200 gauge\n");
-    if let Some(top_200) = validators.get(199) {
-        output.push_str(&format!(
-            "solana_validator_top_200 {}\n",
-            top_200.credits_earned
-        ));
+        output.push_str(&format!("# TYPE solana_validator_{name} gauge\n"));
+        if let Some(per_sol) = ranked.get(position).and_then(|v| v.reward_per_sol()) {
+            output.push_str(&format!("solana_validator_{name} {per_sol}\n"));
+        }
     }
 
     // Active validator count
@@ -364,18 +408,95 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
         let (validators, count) = calculate_metrics(accounts, 1042, 1042).unwrap();
         assert_eq!(count, 2);
-        assert_eq!(validators[0].credits_earned, 5_440_927_420);
-        assert_eq!(validators[1].credits_earned, 4_923_619_318);
+        // More raw lamports (5.44e9 on 347,671 SOL) ranks BELOW fewer lamports on less
+        // stake (4.92e9 on 296,603 SOL): 15,649.6 vs 16,600.0 lamports per staked SOL.
+        assert_eq!(validators[0].credits_earned, 4_923_619_318);
+        assert_eq!(validators[0].activated_stake, 296_603_043_095_931);
+        assert_eq!(validators[1].credits_earned, 5_440_927_420);
+        assert_eq!(validators[1].activated_stake, 347_671_486_449_531);
         assert_eq!(validators[0].rank, 1);
         assert_eq!(validators[1].rank, 2);
+        assert_eq!(validators[0].reward_per_sol(), Some(16600.029678075633));
+        assert_eq!(validators[1].reward_per_sol(), Some(15649.622221147609));
         let text = export_prometheus_metrics(validators, count, 1, 0.2, 0);
         assert!(text.contains("solana_validator_active 2\n"));
-        assert!(text.contains("solana_validator_top_1 5440927420\n"));
+        assert!(text.contains("solana_validator_top_1 16600.029678075633\n"));
+        assert!(text.contains("solana_validator_alpenglow_reward_per_sol{identity=\"9LjQ5UC1"));
+        assert!(text.contains(
+            "solana_validator_activated_stake_lamports{identity=\"CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D\"} 347671486449531\n"
+        ));
         assert_eq!(
             text.lines()
                 .filter(|l| l.starts_with("solana_validator_alpenglow_rewards_lamports{"))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn zero_stake_accounts_are_exported_but_unranked() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        json["current"][0]["activatedStake"] = serde_json::json!(0);
+        let accounts = serde_json::from_value(json).unwrap();
+        let (validators, count) = calculate_metrics(accounts, 1042, 1042).unwrap();
+        assert_eq!(count, 2);
+        // The staked account ranks first; the zero-stake one is last with rank 0.
+        assert_eq!(validators[0].rank, 1);
+        assert_eq!(validators[0].activated_stake, 296_603_043_095_931);
+        assert_eq!(validators[1].rank, 0);
+        assert_eq!(validators[1].activated_stake, 0);
+        assert_eq!(validators[1].reward_per_sol(), None);
+        let text = export_prometheus_metrics(validators, count, 1, 0.2, 0);
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("solana_validator_rating_position{"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("solana_validator_alpenglow_reward_per_sol{"))
+                .count(),
+            1
+        );
+        // Raw lamports and stake are still exported for the unranked account.
+        assert!(text.contains(
+            "solana_validator_activated_stake_lamports{identity=\"CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D\"} 0\n"
+        ));
+        assert!(text.contains(
+            "solana_validator_alpenglow_rewards_lamports{identity=\"CiHvrTZsFoPpziogcnfMWfWnnZiNvxjSz3et5PehMA5D\"} 5440927420\n"
+        ));
+        // No top-100/200 values with one ranked account; top_1 is present.
+        assert!(text.contains("solana_validator_top_1 16600.029678075633\n"));
+        assert!(!text
+            .lines()
+            .any(|l| l.starts_with("solana_validator_top_100 ")));
+    }
+
+    #[test]
+    fn reward_per_stake_order_is_exact() {
+        let v = |credits, stake| ValidatorMetrics {
+            vote_pubkey: String::new(),
+            root_distance: 0,
+            vote_distance: 0,
+            credits_earned: credits,
+            activated_stake: stake,
+            rank: 0,
+        };
+        // 3/2 > 4/3 ; 2/4 == 1/2 ; u64::MAX cross products must not overflow.
+        assert_eq!(
+            cmp_reward_per_stake(&v(3, 2), &v(4, 3)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            cmp_reward_per_stake(&v(4, 3), &v(3, 2)),
+            std::cmp::Ordering::Greater
+        );
+        assert!(same_reward_per_stake(&v(2, 4), &v(1, 2)));
+        assert_eq!(
+            cmp_reward_per_stake(&v(u64::MAX, u64::MAX), &v(u64::MAX, u64::MAX)),
+            std::cmp::Ordering::Equal
         );
     }
 
