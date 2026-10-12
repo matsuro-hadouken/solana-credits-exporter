@@ -49,9 +49,13 @@ struct ValidatorMetrics {
     /// Share (0..1) of the stake of all validators with an `inclusion_relative` value
     /// whose inclusion is strictly below this validator's. 1.0 = best-included.
     pub stake_beaten_share: Option<f64>,
+    /// Rank by `inclusion_relative`, 1 = best-included; ties share a rank and the next
+    /// rank skips (1, 2, 2, 4). Absent while `inclusion_relative` is.
+    pub inclusion_rank: Option<usize>,
 }
 
-/// Fills `stake_beaten_share` from `inclusion_relative` and stake in one sorted pass.
+/// Fills `stake_beaten_share` and `inclusion_rank` from `inclusion_relative` and stake
+/// in one sorted pass.
 fn fill_stake_beaten_share(validators: &mut [ValidatorMetrics]) {
     let mut scored: Vec<(f64, u64, usize)> = validators
         .iter()
@@ -72,8 +76,11 @@ fn fill_stake_beaten_share(validators: &mut [ValidatorMetrics]) {
             j += 1;
         }
         let share = below as f64 / total as f64;
+        // Everyone in scored[j..] has a strictly higher inclusion.
+        let rank = scored.len() - j + 1;
         for entry in &scored[i..j] {
             validators[entry.2].stake_beaten_share = Some(share);
+            validators[entry.2].inclusion_rank = Some(rank);
             below += entry.1 as u128;
         }
         i = j;
@@ -191,9 +198,9 @@ fn same_reward_per_stake(a: &ValidatorMetrics, b: &ValidatorMetrics) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 struct EpochSnapshot {
     pub epoch: u64,
-    /// `(vote pubkey, inclusion_relative, stake_beaten_share)` for every validator that
-    /// had an inclusion value.
-    pub inclusion_relative: Vec<(String, f64, f64)>,
+    /// `(vote pubkey, inclusion_relative, stake_beaten_share, inclusion_rank)` for every
+    /// validator that had an inclusion value.
+    pub inclusion_relative: Vec<(String, f64, f64, usize)>,
 }
 
 /// Keeps the newest sample of the running epoch and freezes it when the first sample of
@@ -222,6 +229,7 @@ impl EpochMemory {
                             v.vote_pubkey.clone(),
                             i,
                             v.stake_beaten_share.unwrap_or(0.0),
+                            v.inclusion_rank.unwrap_or(0),
                         )
                     })
                 })
@@ -377,6 +385,7 @@ fn calculate_metrics(
             voter_reward_lamports,
             inclusion_relative,
             stake_beaten_share: None,
+            inclusion_rank: None,
         });
     }
     fill_stake_beaten_share(&mut validators);
@@ -544,6 +553,17 @@ fn export_prometheus_metrics(
         }
     }
 
+    output.push_str("# HELP solana_validator_alpenglow_inclusion_rank Rank by solana_validator_alpenglow_inclusion_relative among validators with an inclusion value; 1 = best-included, ties share a rank\n");
+    output.push_str("# TYPE solana_validator_alpenglow_inclusion_rank gauge\n");
+    for validator in &validators {
+        if let Some(rank) = validator.inclusion_rank {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_inclusion_rank{{identity=\"{}\"}} {}\n",
+                validator.vote_pubkey, rank
+            ));
+        }
+    }
+
     // Previous-epoch scoreboard: the last sample before the boundary, frozen
     output.push_str("# HELP solana_validator_exporter_previous_epoch Epoch described by the *_previous_epoch gauges (its last sample before the boundary); absent until the exporter has crossed an epoch boundary\n");
     output.push_str("# TYPE solana_validator_exporter_previous_epoch gauge\n");
@@ -556,7 +576,7 @@ fn export_prometheus_metrics(
     output.push_str("# HELP solana_validator_alpenglow_inclusion_relative_previous_epoch Final solana_validator_alpenglow_inclusion_relative of the previous epoch, frozen at its last sample before the boundary\n");
     output.push_str("# TYPE solana_validator_alpenglow_inclusion_relative_previous_epoch gauge\n");
     if let Some(previous) = previous {
-        for (vote_pubkey, inclusion, _) in &previous.inclusion_relative {
+        for (vote_pubkey, inclusion, _, _) in &previous.inclusion_relative {
             output.push_str(&format!(
                 "solana_validator_alpenglow_inclusion_relative_previous_epoch{{identity=\"{vote_pubkey}\"}} {inclusion}\n"
             ));
@@ -565,10 +585,21 @@ fn export_prometheus_metrics(
     output.push_str("# HELP solana_validator_alpenglow_stake_beaten_share_previous_epoch Final solana_validator_alpenglow_stake_beaten_share of the previous epoch, frozen at its last sample before the boundary\n");
     output.push_str("# TYPE solana_validator_alpenglow_stake_beaten_share_previous_epoch gauge\n");
     if let Some(previous) = previous {
-        for (vote_pubkey, _, share) in &previous.inclusion_relative {
+        for (vote_pubkey, _, share, _) in &previous.inclusion_relative {
             output.push_str(&format!(
                 "solana_validator_alpenglow_stake_beaten_share_previous_epoch{{identity=\"{vote_pubkey}\"}} {share}\n"
             ));
+        }
+    }
+    output.push_str("# HELP solana_validator_alpenglow_inclusion_rank_previous_epoch Final solana_validator_alpenglow_inclusion_rank of the previous epoch, frozen at its last sample before the boundary\n");
+    output.push_str("# TYPE solana_validator_alpenglow_inclusion_rank_previous_epoch gauge\n");
+    if let Some(previous) = previous {
+        for (vote_pubkey, _, _, rank) in &previous.inclusion_relative {
+            if *rank > 0 {
+                output.push_str(&format!(
+                    "solana_validator_alpenglow_inclusion_rank_previous_epoch{{identity=\"{vote_pubkey}\"}} {rank}\n"
+                ));
+            }
         }
     }
 
@@ -1084,6 +1115,7 @@ mod tests {
             voter_reward_lamports: None,
             inclusion_relative: inclusion,
             stake_beaten_share: inclusion.map(|_| 0.25),
+            inclusion_rank: inclusion.map(|_| 7),
         };
         let mut memory = EpochMemory::default();
         memory.observe(1042, &[v("A", Some(0.990)), v("B", None)]);
@@ -1096,8 +1128,8 @@ mod tests {
         assert_eq!(
             frozen.inclusion_relative,
             vec![
-                ("A".to_string(), 0.995, 0.25),
-                ("B".to_string(), 1.001, 0.25)
+                ("A".to_string(), 0.995, 0.25, 7),
+                ("B".to_string(), 1.001, 0.25, 7)
             ]
         );
         // A stale sample from a lagging RPC never overwrites or freezes anything.
@@ -1109,13 +1141,16 @@ mod tests {
         assert_eq!(frozen.epoch, 1043);
         assert_eq!(
             frozen.inclusion_relative,
-            vec![("A".to_string(), 0.7, 0.25)]
+            vec![("A".to_string(), 0.7, 0.25, 7)]
         );
 
         let text = export_prometheus_metrics(vec![], None, memory.previous(), 0, 0, 1, 0.1, 0);
         assert!(text.contains("solana_validator_exporter_previous_epoch 1043\n"));
         assert!(text.contains(
             "solana_validator_alpenglow_inclusion_relative_previous_epoch{identity=\"A\"} 0.7\n"
+        ));
+        assert!(text.contains(
+            "solana_validator_alpenglow_inclusion_rank_previous_epoch{identity=\"A\"} 7\n"
         ));
         assert!(text.contains(
             "solana_validator_alpenglow_stake_beaten_share_previous_epoch{identity=\"A\"} 0.25\n"
@@ -1141,6 +1176,7 @@ mod tests {
             voter_reward_lamports: None,
             inclusion_relative: inclusion,
             stake_beaten_share: None,
+            inclusion_rank: None,
         };
         // A: 1.0 (stake 10), B: 1.1 (stake 30), C: 1.1 (stake 20), D: 0.9 (stake 40),
         // E: no inclusion (stake 1000, outside the base).
@@ -1164,6 +1200,18 @@ mod tests {
         assert_eq!(share("B"), Some(0.5)); // beats D + A: 50 of 100, tie with C
         assert_eq!(share("C"), Some(0.5));
         assert_eq!(share("E"), None);
+        let rank = |k: &str| {
+            validators
+                .iter()
+                .find(|v| v.vote_pubkey == k)
+                .unwrap()
+                .inclusion_rank
+        };
+        assert_eq!(rank("B"), Some(1));
+        assert_eq!(rank("C"), Some(1)); // tie shares rank 1
+        assert_eq!(rank("A"), Some(3)); // next rank skips
+        assert_eq!(rank("D"), Some(4));
+        assert_eq!(rank("E"), None);
     }
 
     #[test]
@@ -1215,6 +1263,7 @@ mod tests {
             voter_reward_lamports: None,
             inclusion_relative: None,
             stake_beaten_share: None,
+            inclusion_rank: None,
         };
         // 3/2 > 4/3 ; 2/4 == 1/2 ; u64::MAX cross products must not overflow.
         assert_eq!(
