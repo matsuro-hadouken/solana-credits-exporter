@@ -1660,8 +1660,15 @@ mod tests {
             "context": {"slot": 444620256},
             "value": {"byIdentity": {}, "range": {"firstSlot": 0, "lastSlot": 0}}
         });
+        // Call order: epoch, production, accounts, production, epoch.
         let (client, server) = mock_rpc(
-            vec![epoch(1042), production, accounts, epoch(1043)],
+            vec![
+                epoch(1042),
+                production.clone(),
+                accounts,
+                production,
+                epoch(1043),
+            ],
             Duration::ZERO,
         )
         .await;
