@@ -24,6 +24,13 @@ const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
 /// Blocks the cluster must have produced this epoch before the leader-lump model is
 /// exported; below this the per-block average is too fresh to subtract safely.
 const MIN_BLOCKS_FOR_MODEL: u64 = 1_000;
+/// Per-block residual of the leader-lump estimate, as a fraction of the cluster-average
+/// leader half of a block (`reward_per_block / 2`). Measured on testnet epoch 1057 from
+/// two independent windows (410 validators): 0.20. The 1-sigma noise a validator's
+/// `inclusion_relative` carries is `0.2 * reward_per_block / 2 * sqrt(blocks) / voter`,
+/// about 0.2 / sqrt(blocks) when blocks are proportional to stake: 10% at 4 blocks, 2%
+/// at 100, 1% at 400.
+const LUMP_RESIDUAL_PER_BLOCK: f64 = 0.2;
 
 #[derive(Debug, Clone)]
 struct ValidatorMetrics {
@@ -49,14 +56,20 @@ struct ValidatorMetrics {
     /// Share (0..1) of the stake of all validators with an `inclusion_relative` value
     /// whose inclusion is strictly below this validator's. 1.0 = best-included.
     pub stake_beaten_share: Option<f64>,
-    /// Rank by `inclusion_relative`, 1 = best-included; ties share a rank and the next
-    /// rank skips (1, 2, 2, 4). Absent while `inclusion_relative` is.
+    /// 1-sigma noise of `inclusion_relative` from the leader-lump residual
+    /// (`LUMP_RESIDUAL_PER_BLOCK`). Absent without inclusion or with no voter reward.
+    pub inclusion_noise: Option<f64>,
+    /// Rank by the lower confidence bound `inclusion_relative - inclusion_noise`,
+    /// 1 = best demonstrably included; ties share a rank and the next rank skips
+    /// (1, 2, 2, 4). A validator with few blocks has wide noise and ranks low until its
+    /// lump estimate settles. Absent without inclusion.
     pub inclusion_rank: Option<usize>,
 }
 
-/// Fills `stake_beaten_share` and `inclusion_rank` from `inclusion_relative` and stake
-/// in one sorted pass.
-fn fill_stake_beaten_share(validators: &mut [ValidatorMetrics]) {
+/// Fills `stake_beaten_share`, `inclusion_noise` and `inclusion_rank` from
+/// `inclusion_relative`, stake, blocks and the voter reward. `reward_per_block` is the
+/// cluster average from the model (0 when there is none; then noise is 0).
+fn fill_stake_beaten_share(validators: &mut [ValidatorMetrics], reward_per_block: f64) {
     let mut scored: Vec<(f64, u64, usize)> = validators
         .iter()
         .enumerate()
@@ -76,12 +89,42 @@ fn fill_stake_beaten_share(validators: &mut [ValidatorMetrics]) {
             j += 1;
         }
         let share = below as f64 / total as f64;
-        // Everyone in scored[j..] has a strictly higher inclusion.
-        let rank = scored.len() - j + 1;
         for entry in &scored[i..j] {
             validators[entry.2].stake_beaten_share = Some(share);
-            validators[entry.2].inclusion_rank = Some(rank);
             below += entry.1 as u128;
+        }
+        i = j;
+    }
+    // Noise, then rank by the lower confidence bound so a few lucky lumps cannot put
+    // a small validator on top: its bound is wide until its blocks accumulate.
+    for v in validators.iter_mut() {
+        v.inclusion_noise = match (v.inclusion_relative, v.voter_reward_lamports) {
+            (Some(_), Some(voter)) if voter > 0.0 => Some(
+                LUMP_RESIDUAL_PER_BLOCK * reward_per_block / 2.0 * v.blocks_produced.sqrt() / voter,
+            ),
+            _ => None,
+        };
+    }
+    let mut ranked: Vec<(f64, usize)> = scored
+        .iter()
+        .map(|(x, _, i)| {
+            let bound = match validators[*i].inclusion_noise {
+                Some(noise) => x - noise,
+                // Inclusion without a positive voter estimate: nothing to stand on.
+                None => f64::NEG_INFINITY,
+            };
+            (bound, *i)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut i = 0;
+    while i < ranked.len() {
+        let mut j = i;
+        while j < ranked.len() && ranked[j].0 == ranked[i].0 {
+            j += 1;
+        }
+        for entry in &ranked[i..j] {
+            validators[entry.1].inclusion_rank = Some(i + 1);
         }
         i = j;
     }
@@ -385,10 +428,14 @@ fn calculate_metrics(
             voter_reward_lamports,
             inclusion_relative,
             stake_beaten_share: None,
+            inclusion_noise: None,
             inclusion_rank: None,
         });
     }
-    fill_stake_beaten_share(&mut validators);
+    fill_stake_beaten_share(
+        &mut validators,
+        model.map_or(0.0, |model| model.reward_per_block),
+    );
     // Staked accounts first, ordered by reward per staked SOL (exact, no floats);
     // zero-stake accounts last, unranked. Pubkey keeps output order deterministic.
     validators.sort_by(|a, b| {
@@ -553,7 +600,18 @@ fn export_prometheus_metrics(
         }
     }
 
-    output.push_str("# HELP solana_validator_alpenglow_inclusion_rank Rank by solana_validator_alpenglow_inclusion_relative among validators with an inclusion value; 1 = best-included, ties share a rank\n");
+    output.push_str("# HELP solana_validator_alpenglow_inclusion_noise 1-sigma noise of solana_validator_alpenglow_inclusion_relative from the leader-lump residual (0.2 of a block's leader half per block): 0.2*reward_per_block/2*sqrt(blocks)/voter_reward, about 0.2/sqrt(blocks)\n");
+    output.push_str("# TYPE solana_validator_alpenglow_inclusion_noise gauge\n");
+    for validator in &validators {
+        if let Some(noise) = validator.inclusion_noise {
+            output.push_str(&format!(
+                "solana_validator_alpenglow_inclusion_noise{{identity=\"{}\"}} {}\n",
+                validator.vote_pubkey, noise
+            ));
+        }
+    }
+
+    output.push_str("# HELP solana_validator_alpenglow_inclusion_rank Rank by the lower confidence bound inclusion_relative - inclusion_noise; 1 = best demonstrably included, ties share a rank; a validator with few blocks ranks low until its lump estimate settles\n");
     output.push_str("# TYPE solana_validator_alpenglow_inclusion_rank gauge\n");
     for validator in &validators {
         if let Some(rank) = validator.inclusion_rank {
@@ -1115,6 +1173,7 @@ mod tests {
             voter_reward_lamports: None,
             inclusion_relative: inclusion,
             stake_beaten_share: inclusion.map(|_| 0.25),
+            inclusion_noise: None,
             inclusion_rank: inclusion.map(|_| 7),
         };
         let mut memory = EpochMemory::default();
@@ -1164,30 +1223,9 @@ mod tests {
 
     #[test]
     fn stake_beaten_share_is_strict_and_tie_aware() {
-        let v = |key: &str, stake: u64, inclusion: Option<f64>| ValidatorMetrics {
-            vote_pubkey: key.to_string(),
-            root_distance: 0,
-            vote_distance: 0,
-            credits_earned: 0,
-            activated_stake: stake,
-            rank: 0,
-            leader_slots: 0.0,
-            blocks_produced: 0.0,
-            voter_reward_lamports: None,
-            inclusion_relative: inclusion,
-            stake_beaten_share: None,
-            inclusion_rank: None,
-        };
-        // A: 1.0 (stake 10), B: 1.1 (stake 30), C: 1.1 (stake 20), D: 0.9 (stake 40),
-        // E: no inclusion (stake 1000, outside the base).
-        let mut validators = vec![
-            v("A", 10, Some(1.0)),
-            v("B", 30, Some(1.1)),
-            v("C", 20, Some(1.1)),
-            v("D", 40, Some(0.9)),
-            v("E", 1000, None),
-        ];
-        fill_stake_beaten_share(&mut validators);
+        let mut validators = noise_fixture();
+        // reward_per_block 0: no noise, rank is the plain inclusion order.
+        fill_stake_beaten_share(&mut validators, 0.0);
         let share = |k: &str| {
             validators
                 .iter()
@@ -1196,9 +1234,10 @@ mod tests {
                 .stake_beaten_share
         };
         assert_eq!(share("D"), Some(0.0));
-        assert_eq!(share("A"), Some(0.4)); // beats D: 40 of 100
-        assert_eq!(share("B"), Some(0.5)); // beats D + A: 50 of 100, tie with C
-        assert_eq!(share("C"), Some(0.5));
+        assert!((share("A").unwrap() - 40.0 / 101.0).abs() < 1e-12); // beats D
+        assert!((share("B").unwrap() - 50.0 / 101.0).abs() < 1e-12); // beats D + A, tie with C
+        assert_eq!(share("B"), share("C"));
+        assert!((share("F").unwrap() - 100.0 / 101.0).abs() < 1e-12);
         assert_eq!(share("E"), None);
         let rank = |k: &str| {
             validators
@@ -1207,11 +1246,79 @@ mod tests {
                 .unwrap()
                 .inclusion_rank
         };
-        assert_eq!(rank("B"), Some(1));
-        assert_eq!(rank("C"), Some(1)); // tie shares rank 1
-        assert_eq!(rank("A"), Some(3)); // next rank skips
-        assert_eq!(rank("D"), Some(4));
+        assert_eq!(rank("F"), Some(1));
+        assert_eq!(rank("B"), Some(2));
+        assert_eq!(rank("C"), Some(2)); // tie shares rank 2
+        assert_eq!(rank("A"), Some(4)); // next rank skips
+        assert_eq!(rank("D"), Some(5));
         assert_eq!(rank("E"), None);
+        assert!(validators
+            .iter()
+            .all(|v| v.inclusion_noise == v.inclusion_relative.map(|_| 0.0)));
+    }
+
+    /// A: 1.0 (stake 10, 100 blocks), B: 1.1 (30, 250), C: 1.1 (20, 100), D: 0.9 (40, 300),
+    /// E: no inclusion (1000 stake, outside the base), F: 2.0 on 4 blocks with a tiny
+    /// voter estimate (lucky lumps). Voter reward = stake * 1e6 except F.
+    fn noise_fixture() -> Vec<ValidatorMetrics> {
+        let v = |key: &str, stake: u64, inclusion: Option<f64>, blocks: f64, voter: f64| {
+            ValidatorMetrics {
+                vote_pubkey: key.to_string(),
+                root_distance: 0,
+                vote_distance: 0,
+                credits_earned: 0,
+                activated_stake: stake,
+                rank: 0,
+                leader_slots: 0.0,
+                blocks_produced: blocks,
+                voter_reward_lamports: inclusion.map(|_| voter),
+                inclusion_relative: inclusion,
+                stake_beaten_share: None,
+                inclusion_noise: None,
+                inclusion_rank: None,
+            }
+        };
+        vec![
+            v("A", 10, Some(1.0), 100.0, 1e7),
+            v("B", 30, Some(1.1), 250.0, 3e7),
+            v("C", 20, Some(1.1), 100.0, 2e7),
+            v("D", 40, Some(0.9), 300.0, 4e7),
+            v("E", 1000, None, 10.0, 0.0),
+            v("F", 1, Some(2.0), 4.0, 1e3),
+        ]
+    }
+
+    #[test]
+    fn rank_uses_lower_confidence_bound() {
+        let mut validators = noise_fixture();
+        // reward_per_block 2e6 -> noise = 0.2 * 1e6 * sqrt(blocks) / voter
+        fill_stake_beaten_share(&mut validators, 2e6);
+        let get = |k: &str| validators.iter().find(|v| v.vote_pubkey == k).unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(get("A").inclusion_noise.unwrap(), 0.2)); // 2e5*10/1e7
+        assert!(close(
+            get("B").inclusion_noise.unwrap(),
+            0.2 * 250f64.sqrt() / 30.0
+        ));
+        assert!(close(get("C").inclusion_noise.unwrap(), 0.1)); // 2e5*10/2e7
+        assert!(close(
+            get("D").inclusion_noise.unwrap(),
+            0.2 * 300f64.sqrt() / 40.0
+        ));
+        assert!(close(get("F").inclusion_noise.unwrap(), 400.0)); // 2e5*2/1e3
+        assert_eq!(get("E").inclusion_noise, None);
+        // bounds: C 1.0, B ~0.9946, D ~0.8134, A 0.8, F -398 -> F last despite 2.0
+        assert_eq!(get("C").inclusion_rank, Some(1));
+        assert_eq!(get("B").inclusion_rank, Some(2));
+        assert_eq!(get("D").inclusion_rank, Some(3));
+        assert_eq!(get("A").inclusion_rank, Some(4));
+        assert_eq!(get("F").inclusion_rank, Some(5));
+        assert_eq!(get("E").inclusion_rank, None);
+        // stake-beaten share ignores noise: F beats everyone with a value.
+        assert!(close(get("F").stake_beaten_share.unwrap(), 100.0 / 101.0));
+        let text = export_prometheus_metrics(validators, None, None, 6, 0, 1, 0.1, 0);
+        assert!(text.contains("solana_validator_alpenglow_inclusion_noise{identity=\"C\"} 0.1\n"));
+        assert!(text.contains("solana_validator_alpenglow_inclusion_rank{identity=\"F\"} 5\n"));
     }
 
     #[test]
@@ -1263,6 +1370,7 @@ mod tests {
             voter_reward_lamports: None,
             inclusion_relative: None,
             stake_beaten_share: None,
+            inclusion_noise: None,
             inclusion_rank: None,
         };
         // 3/2 > 4/3 ; 2/4 == 1/2 ; u64::MAX cross products must not overflow.
