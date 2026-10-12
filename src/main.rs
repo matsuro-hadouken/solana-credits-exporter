@@ -6,7 +6,7 @@ use solana_client::{
     rpc_response::{RpcBlockProduction, RpcVoteAccountInfo, RpcVoteAccountStatus},
 };
 use solana_sdk::commitment_config::CommitmentConfig;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -241,9 +241,18 @@ fn same_reward_per_stake(a: &ValidatorMetrics, b: &ValidatorMetrics) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 struct EpochSnapshot {
     pub epoch: u64,
-    /// `(vote pubkey, inclusion_relative, stake_beaten_share, inclusion_rank)` for every
-    /// validator that had an inclusion value.
-    pub inclusion_relative: Vec<(String, f64, f64, usize)>,
+    /// Every validator that had an inclusion value.
+    pub entries: Vec<SnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SnapshotEntry {
+    pub vote_pubkey: String,
+    pub inclusion: f64,
+    pub share: f64,
+    pub rank: usize,
+    /// Voter reward estimate behind `inclusion`; carried forward by `stabilize`.
+    pub voter: f64,
 }
 
 /// Keeps the newest sample of the running epoch and freezes it when the first sample of
@@ -264,16 +273,15 @@ impl EpochMemory {
         }
         self.latest = Some(EpochSnapshot {
             epoch,
-            inclusion_relative: validators
+            entries: validators
                 .iter()
                 .filter_map(|v| {
-                    v.inclusion_relative.map(|i| {
-                        (
-                            v.vote_pubkey.clone(),
-                            i,
-                            v.stake_beaten_share.unwrap_or(0.0),
-                            v.inclusion_rank.unwrap_or(0),
-                        )
+                    v.inclusion_relative.map(|inclusion| SnapshotEntry {
+                        vote_pubkey: v.vote_pubkey.clone(),
+                        inclusion,
+                        share: v.stake_beaten_share.unwrap_or(0.0),
+                        rank: v.inclusion_rank.unwrap_or(0),
+                        voter: v.voter_reward_lamports.unwrap_or(0.0),
                     })
                 })
                 .collect(),
@@ -331,6 +339,53 @@ struct Sample {
     /// inconsistent (total below baseline). Never fatal for the other accounts.
     pub skipped_accounts: usize,
     pub model: Option<ClusterRewardModel>,
+    /// Vote accounts whose identity produced a block while the sample's RPC calls were
+    /// in flight: their credits and block count may disagree by one leader lump.
+    pub unstable: HashSet<String>,
+}
+
+/// Replaces the inclusion of `sample.unstable` validators with their value from the
+/// previous sample of the same epoch (or drops it when there is none), then recomputes
+/// shares, noise and ranks. Returns how many were carried forward.
+///
+/// A leader block landing between getBlockProduction and getVoteAccounts shows in one
+/// and not the other, which moves that validator's inclusion by a whole lump (about
+/// 0.3% for a 300k SOL validator, more than the spread of the top 25) for one sample.
+fn stabilize(sample: &mut Sample, memory: &EpochMemory, epoch: u64) -> usize {
+    if sample.unstable.is_empty() {
+        return 0;
+    }
+    let latest = memory
+        .latest
+        .as_ref()
+        .filter(|latest| latest.epoch == epoch);
+    let mut carried = 0;
+    for v in &mut sample.validators {
+        if !sample.unstable.contains(&v.vote_pubkey) {
+            continue;
+        }
+        match latest.and_then(|l| l.entries.iter().find(|e| e.vote_pubkey == v.vote_pubkey)) {
+            Some(entry) => {
+                v.inclusion_relative = Some(entry.inclusion);
+                v.voter_reward_lamports = Some(entry.voter);
+                carried += 1;
+            }
+            None => {
+                v.inclusion_relative = None;
+                v.voter_reward_lamports = None;
+            }
+        }
+    }
+    for v in &mut sample.validators {
+        v.stake_beaten_share = None;
+        v.inclusion_noise = None;
+        v.inclusion_rank = None;
+    }
+    fill_stake_beaten_share(
+        &mut sample.validators,
+        sample.model.map_or(0.0, |model| model.reward_per_block),
+    );
+    carried
 }
 
 fn calculate_metrics(
@@ -461,6 +516,7 @@ fn calculate_metrics(
         active_count,
         skipped_accounts,
         model,
+        unstable: HashSet::new(),
     })
 }
 
@@ -491,16 +547,32 @@ async fn fetch_and_calculate_metrics(
         }
     };
     let before = client.get_epoch_info().await?;
-    // Block production first, then vote accounts: a leader block landing between the
-    // two calls then shows in credits but not yet in blocks, which only understates
-    // the leader lump for one sample. The epoch check below brackets both.
-    let production = client.get_block_production().await?.value;
+    // Block production is read before and after the vote accounts. An identity whose
+    // counts differ produced a block while the sample was in flight, so its credits
+    // and block count may disagree by one leader lump; `stabilize` carries its
+    // previous inclusion forward. The epoch check brackets everything.
+    let production_before = client.get_block_production().await?.value;
     let accounts = client.get_vote_accounts().await?;
+    let production = client.get_block_production().await?.value;
     let after = client.get_epoch_info().await?;
     if before.epoch != after.epoch {
         return Err("epoch changed during RPC sample; retrying next poll".into());
     }
-    let sample = calculate_metrics(accounts, Some(&production), after.epoch, migration)?;
+    let moved: HashSet<&String> = production
+        .by_identity
+        .iter()
+        .filter(|(identity, counts)| production_before.by_identity.get(*identity) != Some(*counts))
+        .map(|(identity, _)| identity)
+        .collect();
+    let unstable: HashSet<String> = accounts
+        .current
+        .iter()
+        .chain(accounts.delinquent.iter())
+        .filter(|account| moved.contains(&account.node_pubkey))
+        .map(|account| account.vote_pubkey.clone())
+        .collect();
+    let mut sample = calculate_metrics(accounts, Some(&production), after.epoch, migration)?;
+    sample.unstable = unstable;
     Ok((sample, after.epoch))
 }
 
@@ -634,7 +706,12 @@ fn export_prometheus_metrics(
     output.push_str("# HELP solana_validator_alpenglow_inclusion_relative_previous_epoch Final solana_validator_alpenglow_inclusion_relative of the previous epoch, frozen at its last sample before the boundary\n");
     output.push_str("# TYPE solana_validator_alpenglow_inclusion_relative_previous_epoch gauge\n");
     if let Some(previous) = previous {
-        for (vote_pubkey, inclusion, _, _) in &previous.inclusion_relative {
+        for SnapshotEntry {
+            vote_pubkey,
+            inclusion,
+            ..
+        } in &previous.entries
+        {
             output.push_str(&format!(
                 "solana_validator_alpenglow_inclusion_relative_previous_epoch{{identity=\"{vote_pubkey}\"}} {inclusion}\n"
             ));
@@ -643,7 +720,10 @@ fn export_prometheus_metrics(
     output.push_str("# HELP solana_validator_alpenglow_stake_beaten_share_previous_epoch Final solana_validator_alpenglow_stake_beaten_share of the previous epoch, frozen at its last sample before the boundary\n");
     output.push_str("# TYPE solana_validator_alpenglow_stake_beaten_share_previous_epoch gauge\n");
     if let Some(previous) = previous {
-        for (vote_pubkey, _, share, _) in &previous.inclusion_relative {
+        for SnapshotEntry {
+            vote_pubkey, share, ..
+        } in &previous.entries
+        {
             output.push_str(&format!(
                 "solana_validator_alpenglow_stake_beaten_share_previous_epoch{{identity=\"{vote_pubkey}\"}} {share}\n"
             ));
@@ -652,7 +732,10 @@ fn export_prometheus_metrics(
     output.push_str("# HELP solana_validator_alpenglow_inclusion_rank_previous_epoch Final solana_validator_alpenglow_inclusion_rank of the previous epoch, frozen at its last sample before the boundary\n");
     output.push_str("# TYPE solana_validator_alpenglow_inclusion_rank_previous_epoch gauge\n");
     if let Some(previous) = previous {
-        for (vote_pubkey, _, _, rank) in &previous.inclusion_relative {
+        for SnapshotEntry {
+            vote_pubkey, rank, ..
+        } in &previous.entries
+        {
             if *rank > 0 {
                 output.push_str(&format!(
                     "solana_validator_alpenglow_inclusion_rank_previous_epoch{{identity=\"{vote_pubkey}\"}} {rank}\n"
@@ -836,11 +919,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             // Only lock the cache when updating it
             let new_data = match result {
-                Ok(Ok((sample, epoch))) => {
+                Ok(Ok((mut sample, epoch))) => {
                     let duration = start.elapsed().as_secs_f64();
                     if last_error.take().is_some() {
                         eprintln!("RPC sampling recovered (epoch {epoch})");
                     }
+                    stabilize(&mut sample, &epoch_memory, epoch);
                     epoch_memory.observe(epoch, &sample.validators);
                     let mut data = export_prometheus_metrics(
                         sample.validators,
@@ -935,6 +1019,7 @@ mod tests {
             active_count: count,
             skipped_accounts,
             model,
+            ..
         } = calculate_metrics(accounts, None, 1042, 1042).unwrap();
         assert_eq!((count, skipped_accounts), (2, 0));
         assert_eq!(model, None);
@@ -1184,13 +1269,14 @@ mod tests {
         memory.observe(1043, &[v("A", Some(0.5))]);
         let frozen = memory.previous().unwrap();
         assert_eq!(frozen.epoch, 1042);
-        assert_eq!(
-            frozen.inclusion_relative,
-            vec![
-                ("A".to_string(), 0.995, 0.25, 7),
-                ("B".to_string(), 1.001, 0.25, 7)
-            ]
-        );
+        let entry = |k: &str, inclusion: f64| SnapshotEntry {
+            vote_pubkey: k.to_string(),
+            inclusion,
+            share: 0.25,
+            rank: 7,
+            voter: 0.0,
+        };
+        assert_eq!(frozen.entries, vec![entry("A", 0.995), entry("B", 1.001)]);
         // A stale sample from a lagging RPC never overwrites or freezes anything.
         memory.observe(1042, &[v("A", Some(0.1))]);
         assert_eq!(memory.previous().unwrap().epoch, 1042);
@@ -1198,10 +1284,7 @@ mod tests {
         memory.observe(1044, &[]);
         let frozen = memory.previous().unwrap();
         assert_eq!(frozen.epoch, 1043);
-        assert_eq!(
-            frozen.inclusion_relative,
-            vec![("A".to_string(), 0.7, 0.25, 7)]
-        );
+        assert_eq!(frozen.entries, vec![entry("A", 0.7)]);
 
         let text = export_prometheus_metrics(vec![], None, memory.previous(), 0, 0, 1, 0.1, 0);
         assert!(text.contains("solana_validator_exporter_previous_epoch 1043\n"));
@@ -1319,6 +1402,77 @@ mod tests {
         let text = export_prometheus_metrics(validators, None, None, 6, 0, 1, 0.1, 0);
         assert!(text.contains("solana_validator_alpenglow_inclusion_noise{identity=\"C\"} 0.1\n"));
         assert!(text.contains("solana_validator_alpenglow_inclusion_rank{identity=\"F\"} 5\n"));
+    }
+
+    #[test]
+    fn stabilize_carries_unstable_validators_forward() {
+        let model = ClusterRewardModel {
+            blocks_produced: 1000,
+            reward_lamports: 2_000_000_000,
+            activated_stake: 100,
+            reward_per_block: 2e6,
+            voter_reward_per_sol: 0.0,
+        };
+        // Previous sample of the epoch: A at 1.0.
+        let mut memory = EpochMemory::default();
+        let mut previous = noise_fixture();
+        previous.retain(|v| v.vote_pubkey != "D");
+        fill_stake_beaten_share(&mut previous, 2e6);
+        memory.observe(1042, &previous);
+        // This sample: A spiked to 1.5 by a lump that landed mid-sample; D also moved
+        // but was never seen before; B and C untouched.
+        let mut sample = Sample {
+            validators: noise_fixture(),
+            active_count: 6,
+            skipped_accounts: 0,
+            model: Some(model),
+            unstable: ["A", "D"].iter().map(|k| k.to_string()).collect(),
+        };
+        let a = sample
+            .validators
+            .iter_mut()
+            .find(|v| v.vote_pubkey == "A")
+            .unwrap();
+        a.inclusion_relative = Some(1.5);
+        a.voter_reward_lamports = Some(1.5e7);
+        let mut memory_prev_epoch = EpochMemory::default();
+        memory_prev_epoch.observe(1041, &previous);
+        // A previous sample from another epoch is not a basis: both are dropped.
+        let mut other = Sample {
+            validators: sample.validators.clone(),
+            active_count: 6,
+            skipped_accounts: 0,
+            model: Some(model),
+            unstable: sample.unstable.clone(),
+        };
+        assert_eq!(stabilize(&mut other, &memory_prev_epoch, 1042), 0);
+        let get = |vals: &[ValidatorMetrics], k: &str| {
+            vals.iter().find(|v| v.vote_pubkey == k).unwrap().clone()
+        };
+        assert_eq!(get(&other.validators, "A").inclusion_relative, None);
+        assert_eq!(get(&other.validators, "A").inclusion_rank, None);
+
+        assert_eq!(stabilize(&mut sample, &memory, 1042), 1);
+        let a = get(&sample.validators, "A");
+        assert_eq!(a.inclusion_relative, Some(1.0));
+        assert_eq!(a.voter_reward_lamports, Some(1e7));
+        // Bounds as in rank_uses_lower_confidence_bound, minus D: C, B, A, F.
+        assert_eq!(a.inclusion_rank, Some(3));
+        let d = get(&sample.validators, "D");
+        assert_eq!(d.inclusion_relative, None);
+        assert_eq!(d.inclusion_rank, None);
+        assert_eq!(get(&sample.validators, "C").inclusion_rank, Some(1));
+        assert_eq!(get(&sample.validators, "B").inclusion_rank, Some(2));
+        assert_eq!(get(&sample.validators, "F").inclusion_rank, Some(4));
+        // Untouched sample: nothing to do.
+        let mut clean = Sample {
+            validators: noise_fixture(),
+            active_count: 6,
+            skipped_accounts: 0,
+            model: Some(model),
+            unstable: HashSet::new(),
+        };
+        assert_eq!(stabilize(&mut clean, &memory, 1042), 0);
     }
 
     #[test]
@@ -1557,6 +1711,7 @@ mod tests {
             active_count: count,
             skipped_accounts,
             model,
+            ..
         } = sample;
         assert!(count > 0);
         assert_eq!(count, validators.len() + skipped_accounts);

@@ -51,8 +51,13 @@ the other halves (`runtime/src/block_component_processor/vote_reward.rs`). A
 validator's reward is therefore its smooth voter income plus one lump per block it
 produced. The exporter estimates the lumps as half of the cluster-average reward per
 block times the validator's blocks produced, subtracts them, and divides what is
-left by stake. Each sample is one `getBlockProduction` plus one `getVoteAccounts`
-call, bracketed by the epoch check.
+left by stake. Each sample is `getBlockProduction`, `getVoteAccounts`, then
+`getBlockProduction` again, bracketed by the epoch check: an identity whose block
+count changed during the sample produced a block while the calls were in flight, so
+its credits and block count may disagree by one lump; such validators keep their
+inclusion from the previous sample of the epoch for this sample (or none if there
+is no previous sample), so a single lump can never move a validator into the top
+of the board for one scrape.
 
 The exporter detects the migration epoch using `getAgGenesisCert` and
 `getEpochSchedule`, separates the migration history at its marker, and uses each
