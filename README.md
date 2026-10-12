@@ -42,8 +42,10 @@ voting performance. Amounts are before reward distribution, not wallet balances.
 
 The existing `identity` label remains a **vote-account public key**, preserving
 existing queries. Update dashboard titles/units from credits to reward lamports
-(or divide by `1e9` for SOL). Reward rank depends on stake and leader rewards;
-it must not be presented as the old voting-performance leaderboard.
+(or divide by `1e9` for SOL). `solana_validator_rating_position` ranks raw reward
+per staked SOL, which includes leader lumps; it must not be presented as the old
+voting-performance leaderboard. Use `solana_validator_alpenglow_inclusion_rank` for
+that.
 
 Leader-lump model: per block with a reward certificate the runtime pays every
 included validator `floor(pot * stake / total / 2)` and the block's leader the sum of
