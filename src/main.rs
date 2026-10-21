@@ -16,7 +16,24 @@ use tokio::sync::Mutex;
 use tokio::task;
 use tokio::time::{sleep, timeout};
 
+/// Default RPC endpoint; override with the `RPC_URL` environment variable (mainnet, a
+/// private node). The migration-epoch detection and the marker parsing are cluster-agnostic.
 const RPC_URL: &str = "https://api.testnet.solana.com";
+/// Default metrics port; override with `METRICS_PORT` to run one instance per cluster.
+const METRICS_PORT: u16 = 59872;
+
+fn rpc_url() -> String {
+    std::env::var("RPC_URL").unwrap_or_else(|_| RPC_URL.to_string())
+}
+
+fn metrics_port() -> u16 {
+    match std::env::var("METRICS_PORT") {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("METRICS_PORT must be a port number, got {value:?}")),
+        Err(_) => METRICS_PORT,
+    }
+}
 const MIGRATION_MARKER: (u64, u64, u64) = (u64::MAX, u64::MAX, u64::MAX);
 type FetchError = Box<dyn Error + Send + Sync>;
 
@@ -903,8 +920,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Background task to fetch and update metrics
     task::spawn(async move {
-        let client =
-            RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
+        let rpc_url = rpc_url();
+        println!("Sampling {rpc_url}");
+        let client = RpcClient::new_with_commitment(rpc_url, CommitmentConfig::finalized());
         let mut migration_epoch = None;
         let mut epoch_memory = EpochMemory::default();
         // Log failures on change only: first occurrence, a different message, recovery.
@@ -986,9 +1004,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    // Serve metrics on all interfaces, port 59872, only for the `/metrics` route.
-    // Reachability is governed by the host firewall, not by the bind address.
-    let addr = ([0, 0, 0, 0], 59872).into();
+    // Serve metrics on all interfaces, port METRICS_PORT (default 59872), only for the
+    // `/metrics` route. Reachability is governed by the host firewall, not by the bind address.
+    let port = metrics_port();
+    let addr = ([0, 0, 0, 0], port).into();
     let make_svc = make_service_fn(move |_conn| {
         let cache = Arc::clone(&cache);
         async move {
@@ -1000,7 +1019,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
     let server = Server::bind(&addr).serve(make_svc);
 
-    println!("Serving metrics on http://0.0.0.0:59872/metrics");
+    println!("Serving metrics on http://0.0.0.0:{port}/metrics");
     server.await?;
 
     Ok(())
@@ -1705,7 +1724,7 @@ mod tests {
     #[ignore = "queries the live public testnet RPC"]
     async fn live_testnet_sample() {
         let client =
-            RpcClient::new_with_commitment(RPC_URL.to_string(), CommitmentConfig::finalized());
+            RpcClient::new_with_commitment(rpc_url(), CommitmentConfig::finalized());
         let (sample, epoch) = timeout(
             Duration::from_secs_f32(4.5),
             fetch_and_calculate_metrics(&client, &mut None),

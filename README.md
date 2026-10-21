@@ -1,7 +1,9 @@
 # Credits Exporter
 
-This branch targets **Alpenglow on testnet only**, using the hardcoded RPC
-`https://api.testnet.solana.com`. The `main` branch is unchanged.
+This branch targets **Alpenglow** clusters. The RPC defaults to
+`https://api.testnet.solana.com`; set `RPC_URL` to sample another cluster (mainnet since
+epoch 1064) and `METRICS_PORT` to run one instance per cluster on the same host. The
+`main` branch is unchanged and stops exporting once the migration marker appears.
 
 Build and run:
 
@@ -10,7 +12,7 @@ cargo build --release --locked
 ./target/release/solana-credits-exporter
 ```
 
-Prometheus endpoint: `http://<host>:59872/metrics` (binds all interfaces; restrict with the host firewall).
+Prometheus endpoint: `http://<host>:59872/metrics` or `METRICS_PORT` (binds all interfaces; restrict with the host firewall).
 Rebuild and replace your existing service binary to apply the change; the service
 configuration below is an example, not an automatic installation.
 
@@ -95,6 +97,9 @@ After=network.target
 
 [Service]
 ExecStart=/home/exporter/bin/solana-credits-exporter
+# Mainnet instance: point at a mainnet RPC and use a second port.
+# Environment=RPC_URL=https://api.mainnet-beta.solana.com
+# Environment=METRICS_PORT=59873
 
 WorkingDirectory=/home/exporter
 
