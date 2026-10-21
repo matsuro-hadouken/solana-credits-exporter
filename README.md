@@ -63,7 +63,7 @@ inclusion from the previous sample of the epoch for this sample (or none if ther
 is no previous sample), so a single lump can never move a validator into the top
 of the board for one scrape.
 
-The exporter detects the migration epoch using `getAgGenesisCert` and
+In the migration epoch block production is counted from the genesis-certificate slot + 9 onward: earlier blocks were Tower blocks and paid no Alpenglow leader reward, so they are not leader lumps (mainnet epoch 1064 migrated ~5,000 slots in, which otherwise clamps every pre-migration leader's `inclusion_relative` to 0). The exporter detects the migration epoch using `getAgGenesisCert` and
 `getEpochSchedule`, separates the migration history at its marker, and uses each
 entry's own baseline. It exports zero for accounts without rewards in the current
 epoch. It excludes RPC delinquent accounts, as the previous exporter did.

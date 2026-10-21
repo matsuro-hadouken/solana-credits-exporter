@@ -2,6 +2,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
+    rpc_config::{RpcBlockProductionConfig, RpcBlockProductionConfigRange},
     rpc_request::RpcRequest,
     rpc_response::{RpcBlockProduction, RpcVoteAccountInfo, RpcVoteAccountStatus},
 };
@@ -35,6 +36,20 @@ fn metrics_port() -> u16 {
     }
 }
 const MIGRATION_MARKER: (u64, u64, u64) = (u64::MAX, u64::MAX, u64::MAX);
+/// Block N carries the reward certificate for slot N - 8 (`NUM_SLOTS_FOR_REWARD`, agave
+/// v4.3). A leader requests reward certs only for `bank_slot > genesis_cert_slot + 8`, so
+/// blocks up to and including that slot pay no leader reward and must not be counted as
+/// leader lumps in the migration epoch.
+const NUM_SLOTS_FOR_REWARD: u64 = 8;
+
+/// Where Alpenglow started on this cluster, from `getAgGenesisCert`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Migration {
+    /// Epoch containing the genesis certificate block.
+    epoch: u64,
+    /// First slot whose block carries a reward certificate (genesis slot + 9).
+    first_reward_slot: u64,
+}
 type FetchError = Box<dyn Error + Send + Sync>;
 
 const LAMPORTS_PER_SOL: u128 = 1_000_000_000;
@@ -537,12 +552,35 @@ fn calculate_metrics(
     })
 }
 
+/// Block production for the current epoch. In the migration epoch only blocks from
+/// `first_reward_slot` on are counted: earlier blocks were Tower blocks and paid no
+/// Alpenglow leader reward, so counting them would subtract lumps that never existed.
+async fn get_block_production(
+    client: &RpcClient,
+    epoch_info: &solana_sdk::epoch_info::EpochInfo,
+    migration: Migration,
+) -> Result<RpcBlockProduction, FetchError> {
+    let epoch_first_slot = epoch_info.absolute_slot - epoch_info.slot_index;
+    if epoch_info.epoch != migration.epoch || migration.first_reward_slot <= epoch_first_slot {
+        return Ok(client.get_block_production().await?.value);
+    }
+    let config = RpcBlockProductionConfig {
+        identity: None,
+        range: Some(RpcBlockProductionConfigRange {
+            first_slot: migration.first_reward_slot,
+            last_slot: None,
+        }),
+        commitment: None,
+    };
+    Ok(client.get_block_production_with_config(config).await?.value)
+}
+
 async fn fetch_and_calculate_metrics(
     client: &RpcClient,
-    migration_epoch: &mut Option<u64>,
+    migration_epoch: &mut Option<Migration>,
 ) -> Result<(Sample, u64), FetchError> {
     let migration = match *migration_epoch {
-        Some(epoch) => epoch,
+        Some(migration) => migration,
         None => {
             let cert: serde_json::Value = client
                 .send(
@@ -558,9 +596,12 @@ async fn fetch_and_calculate_metrics(
                 .and_then(|s| s.as_u64())
                 .ok_or("RPC has no Alpenglow genesis certificate")?;
             let schedule = client.get_epoch_schedule().await?;
-            let epoch = schedule.get_epoch(slot);
-            *migration_epoch = Some(epoch);
-            epoch
+            let migration = Migration {
+                epoch: schedule.get_epoch(slot),
+                first_reward_slot: slot + NUM_SLOTS_FOR_REWARD + 1,
+            };
+            *migration_epoch = Some(migration);
+            migration
         }
     };
     let before = client.get_epoch_info().await?;
@@ -568,9 +609,9 @@ async fn fetch_and_calculate_metrics(
     // counts differ produced a block while the sample was in flight, so its credits
     // and block count may disagree by one leader lump; `stabilize` carries its
     // previous inclusion forward. The epoch check brackets everything.
-    let production_before = client.get_block_production().await?.value;
+    let production_before = get_block_production(client, &before, migration).await?;
     let accounts = client.get_vote_accounts().await?;
-    let production = client.get_block_production().await?.value;
+    let production = get_block_production(client, &before, migration).await?;
     let after = client.get_epoch_info().await?;
     if before.epoch != after.epoch {
         return Err("epoch changed during RPC sample; retrying next poll".into());
@@ -588,7 +629,8 @@ async fn fetch_and_calculate_metrics(
         .filter(|account| moved.contains(&account.node_pubkey))
         .map(|account| account.vote_pubkey.clone())
         .collect();
-    let mut sample = calculate_metrics(accounts, Some(&production), after.epoch, migration)?;
+    let mut sample =
+        calculate_metrics(accounts, Some(&production), after.epoch, migration.epoch)?;
     sample.unstable = unstable;
     Ok((sample, after.epoch))
 }
@@ -1691,7 +1733,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
-        let result = fetch_and_calculate_metrics(&client, &mut Some(1042)).await;
+        let migration = Migration {
+            epoch: 1042,
+            first_reward_slot: 0,
+        };
+        let result = fetch_and_calculate_metrics(&client, &mut Some(migration)).await;
         server.abort();
         let error = result.unwrap_err().to_string();
         assert!(error.contains("epoch changed"), "{error}");
