@@ -1,13 +1,14 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
-use solana_client::{
-    client_error::{ClientError, ClientErrorKind},
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::{RpcBlockProductionConfig, RpcBlockProductionConfigRange},
-    rpc_request::{RpcError, RpcRequest},
-    rpc_response::{RpcBlockProduction, RpcVoteAccountInfo, RpcVoteAccountStatus},
+use solana_commitment_config::CommitmentConfig;
+use solana_epoch_info::EpochInfo;
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_rpc_client_api::{
+    client_error::{Error as ClientError, ErrorKind as ClientErrorKind},
+    config::{RpcBlockProductionConfig, RpcBlockProductionConfigRange},
+    request::{RpcError, RpcRequest},
+    response::{RpcBlockProduction, RpcVoteAccountInfo, RpcVoteAccountStatus},
 };
-use solana_sdk::commitment_config::CommitmentConfig;
 use std::collections::{HashMap, HashSet};
 
 use std::convert::Infallible;
@@ -576,7 +577,7 @@ fn calculate_metrics(
 /// Alpenglow leader reward, so counting them would subtract lumps that never existed.
 async fn get_block_production(
     client: &RpcClient,
-    epoch_info: &solana_sdk::epoch_info::EpochInfo,
+    epoch_info: &EpochInfo,
     migration: Migration,
 ) -> Result<RpcBlockProduction, FetchError> {
     let epoch_first_slot = epoch_info.absolute_slot - epoch_info.slot_index;
