@@ -1,9 +1,10 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use solana_client::{
+    client_error::{ClientError, ClientErrorKind},
     nonblocking::rpc_client::RpcClient,
     rpc_config::{RpcBlockProductionConfig, RpcBlockProductionConfigRange},
-    rpc_request::RpcRequest,
+    rpc_request::{RpcError, RpcRequest},
     rpc_response::{RpcBlockProduction, RpcVoteAccountInfo, RpcVoteAccountStatus},
 };
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -49,6 +50,24 @@ struct Migration {
     epoch: u64,
     /// First slot whose block carries a reward certificate (genesis slot + 9).
     first_reward_slot: u64,
+}
+
+impl Migration {
+    /// Migration before every reported epoch: block production counts from the epoch's first
+    /// slot. Used when the RPC lacks `getAgGenesisCert` (-32601). Valid once the cluster is
+    /// more than 5 epochs past the migration (mainnet: epoch 1070+).
+    const PAST: Self = Self {
+        epoch: 0,
+        first_reward_slot: 0,
+    };
+}
+
+/// JSON-RPC -32601: the node does not serve the method.
+fn method_not_found(error: &ClientError) -> bool {
+    matches!(
+        error.kind(),
+        ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32601, .. })
+    )
 }
 type FetchError = Box<dyn Error + Send + Sync>;
 
@@ -582,23 +601,32 @@ async fn fetch_and_calculate_metrics(
     let migration = match *migration_epoch {
         Some(migration) => migration,
         None => {
-            let cert: serde_json::Value = client
+            let cert: Result<serde_json::Value, ClientError> = client
                 .send(
                     RpcRequest::Custom {
                         method: "getAgGenesisCert",
                     },
                     serde_json::json!([]),
                 )
-                .await?;
-            let slot = cert
-                .get("block")
-                .and_then(|b| b.get("slot"))
-                .and_then(|s| s.as_u64())
-                .ok_or("RPC has no Alpenglow genesis certificate")?;
-            let schedule = client.get_epoch_schedule().await?;
-            let migration = Migration {
-                epoch: schedule.get_epoch(slot),
-                first_reward_slot: slot + NUM_SLOTS_FOR_REWARD + 1,
+                .await;
+            let migration = match cert {
+                Err(error) if method_not_found(&error) => {
+                    eprintln!("RPC lacks getAgGenesisCert; migration treated as past");
+                    Migration::PAST
+                }
+                Err(error) => return Err(error.into()),
+                Ok(cert) => {
+                    let slot = cert
+                        .get("block")
+                        .and_then(|b| b.get("slot"))
+                        .and_then(|s| s.as_u64())
+                        .ok_or("RPC has no Alpenglow genesis certificate")?;
+                    let schedule = client.get_epoch_schedule().await?;
+                    Migration {
+                        epoch: schedule.get_epoch(slot),
+                        first_reward_slot: slot + NUM_SLOTS_FOR_REWARD + 1,
+                    }
+                }
             };
             *migration_epoch = Some(migration);
             migration
@@ -1693,10 +1721,16 @@ mod tests {
                                 .pop_front()
                                 .unwrap_or(serde_json::Value::Null)
                         };
-                        Ok::<_, Infallible>(Response::new(Body::from(
-                            serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
-                                .to_string(),
-                        )))
+                        // Queued `{"error": ...}` is returned as the JSON-RPC error.
+                        let envelope = match result.get("error") {
+                            Some(error) => {
+                                serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "error":error})
+                            }
+                            None => {
+                                serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                            }
+                        };
+                        Ok::<_, Infallible>(Response::new(Body::from(envelope.to_string())))
                     }
                 }))
             }
@@ -1753,6 +1787,38 @@ mod tests {
         .await;
         server.abort();
         assert!(result.is_err());
+    }
+
+    /// -32601 on `getAgGenesisCert`: sample proceeds with `Migration::PAST`, remembered.
+    #[tokio::test]
+    async fn genesis_certificate_method_not_found_takes_the_migration_as_past() {
+        let epoch = serde_json::json!({"epoch":1092, "slotIndex":40000, "slotsInEpoch":432000,
+            "absoluteSlot":471784000, "blockHeight":1, "transactionCount":1});
+        let accounts =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet-migration.json")).unwrap();
+        let production = serde_json::json!({
+            "context": {"slot": 471784000},
+            "value": {"byIdentity": {}, "range": {"firstSlot": 471744000, "lastSlot": 471784000}}
+        });
+        // Call order: certificate (-32601), epoch, production, accounts, production, epoch.
+        let (client, server) = mock_rpc(
+            vec![
+                serde_json::json!({"error": {"code": -32601, "message": "Method not found"}}),
+                epoch.clone(),
+                production.clone(),
+                accounts,
+                production,
+                epoch,
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let mut migration = None;
+        let result = fetch_and_calculate_metrics(&client, &mut migration).await;
+        server.abort();
+        assert_eq!(migration, Some(Migration::PAST));
+        let (_, epoch) = result.unwrap();
+        assert_eq!(epoch, 1092);
     }
 
     #[tokio::test]
